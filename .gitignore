@@ -1,0 +1,18 @@
+# 大型安裝檔（自官方來源下載，不納入版控）
+*.deb
+*.iso
+
+# 備份檔
+*.tar
+*.tar.gz
+*_gitlab_backup.tar
+
+# 作業系統產生的檔案
+.DS_Store
+Thumbs.db
+
+# 編輯器暫存
+.vscode/
+.idea/
+*.swp
+*~
