@@ -85,6 +85,19 @@ valid_ipv4() {
     done
 }
 
+# 憑證用的主機：IPv4 或網域（英數開頭結尾，中間可有 . -）。值會進檔名與 openssl 參數，
+# 所以只收白名單；全數字加點的必須是合法 IPv4（避免 999.1.1.1 被當成網域）。
+valid_cert_host() {
+    [[ $1 =~ ^[0-9.]+$ ]] && { valid_ipv4 "$1"; return; }
+    [[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]
+}
+
+# cert_san_type <主機>：IPv4 輸出 IP，網域輸出 DNS（對應 subjectAltName 的前綴）；不合法回非 0。
+cert_san_type() {
+    valid_cert_host "$1" || return 1
+    if valid_ipv4 "$1"; then echo IP; else echo DNS; fi
+}
+
 # ── 機器檢查 ─────────────────────────────────────────────────────────────────
 
 # 探測用的小函式，獨立出來是為了讓測試能直接重新定義，不必靠空 PATH 之類的手法。
@@ -404,3 +417,30 @@ _managed_change() { # _managed_change <apply|remove> <name> [內容]
 #   rc=0; apply_managed_block … || rc=$?
 apply_managed_block() { _managed_change apply "$1" "$2"; }
 remove_managed_block() { _managed_change remove "$1"; }
+
+# ── 自簽憑證 ─────────────────────────────────────────────────────────────────
+
+# 憑證目錄；GITLAB_SSL_DIR 可由呼叫端（測試）覆寫。
+ssl_dir() { echo "${GITLAB_SSL_DIR:-/etc/gitlab/ssl}"; }
+
+# make_self_signed_cert <IP或網域> [目錄]：不互動（-subj），含 subjectAltName（IP 用 IP:、網域用 DNS:），
+# 效期 10 年，輸出 <目錄>/<主機>.crt 與 .key（.key 權限 600）。已有同名檔案會被覆蓋，
+# 要不要覆蓋由呼叫端決定。偏離原文件（只有 CN、需手動回答問題）的理由見 docs/decision-log.md。
+# install.sh 與 nginx.sh 共用，簽名不改。
+make_self_signed_cert() {
+    local host="$1" dir="${2:-$(ssl_dir)}" type crt key
+    type="$(cert_san_type "$host")" || { echo "✗ 憑證主機不合法：$host" >&2; return 1; }
+    mkdir -p "$dir" || return 1
+    crt="$dir/$host.crt"
+    key="$dir/$host.key"
+    (
+        umask 077
+        openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+            -keyout "$key" -out "$crt" \
+            -subj "/CN=$host" -addext "subjectAltName=$type:$host" 2>/dev/null
+    ) || { rm -f "$crt" "$key"; echo "✗ openssl 產生憑證失敗。" >&2; return 1; }
+    chmod 600 "$key" || return 1
+    chmod 644 "$crt" || return 1
+    echo "  已產生憑證：$crt"
+    echo "  已產生私鑰：$key"
+}

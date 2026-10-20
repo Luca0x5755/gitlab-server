@@ -147,3 +147,42 @@ assert_eq "no-e" "$out" "menu_loop 結束後不替呼叫端打開 set -e"
 # ── 參數檔不進版控 ──
 repo="$(cd "$here/../.." && pwd)"
 assert_status 0 "scripts/gitlab-ops.env 已列入 .gitignore" git -C "$repo" check-ignore -q scripts/gitlab-ops.env
+
+# ── valid_cert_host／cert_san_type（PR-COM-09、10）──
+for h in 192.168.9.129 10.0.0.1 gitlab.example.com gitlab host-1.lan A1; do assert_status 0 "憑證主機合法：$h" valid_cert_host "$h"; done
+for h in "" 999.1.1.1 1.2.3 1.2.3.4.5 01.2.3.4 -bad bad- "a b" 'a;b' 'a$(id)' a/b ../x "a,b" "a:443" "*.example.com" ; do
+    assert_nonzero "憑證主機非法：[$h]" valid_cert_host "$h"
+done
+assert_eq "IP" "$(cert_san_type 192.168.9.129)" "IPv4 → IP"
+assert_eq "DNS" "$(cert_san_type gitlab.example.com)" "網域 → DNS"
+assert_eq "DNS" "$(cert_san_type gitlab)" "單一主機名 → DNS"
+assert_nonzero "非法主機：cert_san_type 失敗" cert_san_type "999.1.1.1"
+assert_eq "" "$(cert_san_type 'a b' 2>/dev/null)" "非法主機：不輸出"
+
+# ── make_self_signed_cert：用真的 openssl 產生，再讀回憑證驗證 SAN ──
+if have_cmd openssl; then
+    cdir="$T_TMP/ssl"
+    make_self_signed_cert 192.168.9.129 "$cdir" </dev/null >/dev/null
+    assert_eq "yes" "$([ -f "$cdir/192.168.9.129.crt" ] && [ -f "$cdir/192.168.9.129.key" ] && echo yes || echo no)" "IP 憑證：.crt／.key 檔名沿用主機"
+    txt="$(openssl x509 -in "$cdir/192.168.9.129.crt" -noout -text)"
+    assert_contains "$txt" "IP Address:192.168.9.129" "IP 憑證：SAN 為 IP Address"
+    assert_not_contains "$txt" "DNS:192.168.9.129" "IP 憑證：SAN 不是 DNS"
+    assert_contains "$txt" "CN = 192.168.9.129" "IP 憑證：CN 為主機"
+    assert_eq "600" "$(stat -c %a "$cdir/192.168.9.129.key")" "私鑰權限 600"
+    # 效期約 10 年（3650 天）
+    assert_status 0 "效期至少 3600 天" openssl x509 -in "$cdir/192.168.9.129.crt" -noout -checkend $((3600 * 86400))
+    make_self_signed_cert gitlab.example.com "$cdir" </dev/null >/dev/null
+    txt="$(openssl x509 -in "$cdir/gitlab.example.com.crt" -noout -text)"
+    assert_contains "$txt" "DNS:gitlab.example.com" "網域憑證：SAN 為 DNS"
+    assert_not_contains "$txt" "IP Address:" "網域憑證：SAN 不是 IP"
+    # 私鑰與憑證成對
+    assert_eq "$(openssl x509 -in "$cdir/gitlab.example.com.crt" -noout -pubkey)" "$(openssl pkey -in "$cdir/gitlab.example.com.key" -pubout)" "私鑰與憑證成對"
+    # 非互動：stdin 關閉也不卡、不提問
+    assert_status 0 "stdin 關閉也能產生（不互動）" bash -c ". '$common'; make_self_signed_cert 10.0.0.1 '$cdir' </dev/null"
+    # 非法主機：不產生任何檔案
+    assert_nonzero "非法主機：不產生憑證" make_self_signed_cert "a;b" "$cdir"
+    assert_eq "no" "$([ -e "$cdir/a;b.crt" ] && echo yes || echo no)" "非法主機：沒有檔案"
+    # 預設目錄走 GITLAB_SSL_DIR
+    GITLAB_SSL_DIR="$T_TMP/ssl2" make_self_signed_cert 10.1.1.1 </dev/null >/dev/null
+    assert_eq "yes" "$([ -f "$T_TMP/ssl2/10.1.1.1.crt" ] && echo yes || echo no)" "預設目錄取 GITLAB_SSL_DIR"
+fi

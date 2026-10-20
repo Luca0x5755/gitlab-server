@@ -16,6 +16,7 @@ _ins_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 INS_REPO_SCRIPT_URL="https://packages.gitlab.com/install/repositories/gitlab/gitlab-ce/script.deb.sh"
 INS_URL_BLOCK="install_external_url"
+INS_HTTPS_BLOCK="install_https"
 
 # ── 驗證與解析（純函式）──────────────────────────────────────────────────────
 
@@ -120,6 +121,23 @@ render_external_url() {
     echo "external_url '$1'"
 }
 
+# 內建 Nginx 的 HTTPS 區塊內容：external_url 改 https 並開啟 HTTP 導向 HTTPS。
+# 兩行放同一個區塊，所以 external_url 與導向不會彼此不一致。
+# 主機驗證沿用憑證用的白名單（值會進 Ruby 單引號字串與憑證檔名）。
+render_https_block() {
+    valid_cert_host "$1" || return 1
+    printf "external_url 'https://%s'\n" "$1"
+    echo "nginx['redirect_http_to_https'] = true"
+}
+
+# 從 external_url 取出主機（去掉 scheme 與 port）；不合法回非 0。
+external_url_host() {
+    local re='^https?://([^/:]+)(:[0-9]+)?$'
+    valid_external_url "$1" || return 1
+    [[ $1 =~ $re ]] || return 1
+    echo "${BASH_REMATCH[1]}"
+}
+
 # 取出 initial_root_password 檔中 `Password:` 後的值（純 bash 前綴剝除，值原樣輸出）。
 # 找不到或值為空回非 0 且不輸出，由呼叫端退回「請 sudo cat 該檔」。
 extract_initial_password() {
@@ -180,7 +198,13 @@ GitLab 伺服器通常不能連外，所以分兩台機器作業：
   - initial_root_password 檔案（/etc/gitlab/initial_root_password）內的密碼只在安裝後
     第一次 reconfigure 起 24 小時內有效，檔案也會在 24 小時後第一次 reconfigure 時自動刪除；
     帳號為 root，請於 24 小時內登入並修改密碼。
-  - 外部 Nginx 請用 nginx.sh；HTTPS、LDAP 由本腳本後續選單項目提供。
+  - 啟用 HTTPS（選單 8）：在 /etc/gitlab/ssl 產生 10 年效期的自簽憑證（含 subjectAltName，
+    主機是 IP 用 IP:、網域用 DNS:），把 external_url 改成 https、開啟 HTTP 導向 HTTPS、
+    ufw allow 443/tcp，並 reconfigure。憑證檔名為 <IP或網域>.crt／.key，須與 external_url
+    的主機一致。自簽憑證瀏覽器會顯示警告，需手動信任或改用正式憑證。
+  - external_url 與 HTTPS 導向寫在同一個管理區塊（install_https）。HTTPS 啟用期間，
+    選單 6 會拒絕執行；要改回 http 請先用選單 9 停用 HTTPS。
+  - 外部 Nginx 請用 nginx.sh；LDAP 由本腳本後續選單項目提供。
 TXT
 }
 
@@ -200,7 +224,14 @@ show_troubleshooting() {
     或安裝前就用 GITLAB_ROOT_PASSWORD／gitlab.rb 設過密碼。忘記密碼請在伺服器執行
     sudo gitlab-rake "gitlab:password:reset[root]" 重設。
   瀏覽器開不起來或被導向錯誤位址：external_url 要與瀏覽器輸入的網址一致；
-    重新執行選單 6 即可整段取代，再 reconfigure。
+    重新執行選單 6 即可整段取代，再 reconfigure；若已啟用 HTTPS，改用選單 8 重新套用。
+  HTTPS 開啟後瀏覽器警告「不安全」：自簽憑證不是公開 CA 簽的，屬預期；可手動信任，
+    或換成正式憑證（同檔名放進 /etc/gitlab/ssl 後 sudo gitlab-ctl reconfigure）。
+  HTTPS 連不上（逾時）：確認 443 已放行（sudo ufw status 應有 443/tcp），
+    以及 external_url 是 https://。
+  reconfigure 後仍用 http、或憑證找不到：憑證檔名必須是 <external_url 的主機>.crt／.key，
+    放在 /etc/gitlab/ssl；伺服器 IP 或網域改了，要重新執行選單 8 產生新憑證。
+  想改回 http：執行選單 9 停用 HTTPS（只移除 HTTPS 區塊；ufw 的 443 規則不動）。
   想還原 gitlab.rb：備份在 /etc/gitlab/gitlab.rb.bak-時間戳，複製回 gitlab.rb 後
     執行 sudo gitlab-ctl reconfigure。
 TXT
@@ -284,6 +315,11 @@ set_external_url() {
     local url body line rc=0
     ins_require_gitlab_host
     require_root
+    # 若 HTTPS 區塊還在，它位於檔尾、external_url 以後出現者為準；這裡改 http 會被蓋掉，
+    # 或造成 redirect 開著而 external_url 是 http。不一致的處理在這裡：拒絕，請先停用 HTTPS。
+    if block_present "$(gitlab_rb_file)" "$INS_HTTPS_BLOCK"; then
+        die "HTTPS 目前已啟用（管理區塊 $INS_HTTPS_BLOCK 控制 external_url）。要改 external_url，請先用選單 9 停用 HTTPS；要換 IP／網域，請重新執行選單 8。"
+    fi
     url="$(ask_param INS_EXTERNAL_URL "external_url（例 http://192.168.9.129）" "" valid_external_url)"
     body="$(render_external_url "$url")"
     echo "將在 $(gitlab_rb_file) 以管理區塊寫入："
@@ -292,6 +328,61 @@ set_external_url() {
     apply_managed_block "$INS_URL_BLOCK" "$body" || rc=$?
     case "$rc" in
         0) echo "✓ external_url 已設定並完成 reconfigure。可用選單 7 查看 root 初始密碼。" ;;
+        1) echo "✗ reconfigure 失敗，見上方說明。" >&2 ;;
+        3) echo "✗ 寫入 gitlab.rb 失敗，已自動還原。" >&2 ;;
+        *) echo "✗ 未寫入任何變更。" >&2 ;;
+    esac
+    return "$rc"
+}
+
+enable_https() {
+    local cur default_host host body line rc=0 crt key
+    ins_require_gitlab_host
+    require_root
+    have_cmd openssl || die "缺少指令 openssl，無法產生憑證。"
+    cur="$(env_get INS_EXTERNAL_URL)"
+    default_host="$(external_url_host "$cur" 2>/dev/null || true)"
+    host="$(ask_param INS_HTTPS_HOST "HTTPS 用的 IP 或網域（須與瀏覽器輸入的一致）" "$default_host" valid_cert_host)"
+    crt="$(ssl_dir)/$host.crt"
+    key="$(ssl_dir)/$host.key"
+    if [ -f "$crt" ] && [ -f "$key" ]; then
+        echo "已有憑證：$crt"
+        if confirm "要重新產生憑證嗎（會覆蓋舊的憑證與私鑰）？"; then
+            make_self_signed_cert "$host"
+        else
+            echo "  沿用既有憑證。"
+        fi
+    else
+        make_self_signed_cert "$host"
+    fi
+    [ -f "$crt" ] && [ -f "$key" ] || die "找不到憑證 $crt 或 $key，未修改 gitlab.rb。"
+    body="$(render_https_block "$host")"
+    echo "將在 $(gitlab_rb_file) 以管理區塊（$INS_HTTPS_BLOCK）寫入："
+    while IFS= read -r line; do echo "    $line"; done <<<"$body"
+    apply_managed_block "$INS_HTTPS_BLOCK" "$body" || rc=$?
+    case "$rc" in
+        0) ;;
+        1) echo "✗ reconfigure 失敗，見上方說明；未開放防火牆 443。" >&2; return 1 ;;
+        3) echo "✗ 寫入 gitlab.rb 失敗，已自動還原。" >&2; return 3 ;;
+        *) echo "✗ 未寫入任何變更。" >&2; return "$rc" ;;
+    esac
+    if have_cmd ufw; then
+        ufw allow 443/tcp || echo "⚠ ufw allow 443/tcp 失敗，請手動放行 443。" >&2
+    else
+        echo "⚠ 找不到 ufw，請自行確認防火牆已放行 443/tcp。" >&2
+    fi
+    echo "✓ HTTPS 已啟用：https://$host （自簽憑證，瀏覽器會警告，屬預期）。"
+}
+
+disable_https() {
+    local rc=0
+    ins_require_gitlab_host
+    require_root
+    block_present "$(gitlab_rb_file)" "$INS_HTTPS_BLOCK" || { echo "HTTPS 目前未由本腳本啟用，不需處理。"; return 0; }
+    confirm "要停用 HTTPS（移除管理區塊 $INS_HTTPS_BLOCK 並 reconfigure）嗎？" || { echo "已取消，未做任何變更。"; return 0; }
+    remove_managed_block "$INS_HTTPS_BLOCK" || rc=$?
+    case "$rc" in
+        0) echo "✓ 已停用 HTTPS；external_url 回到其他設定（選單 6 的區塊或 gitlab.rb 原值）。ufw 的 443 規則與憑證檔未動。" ;;
         1) echo "✗ reconfigure 失敗，見上方說明。" >&2 ;;
         3) echo "✗ 寫入 gitlab.rb 失敗，已自動還原。" >&2 ;;
         *) echo "✗ 未寫入任何變更。" >&2 ;;
@@ -335,8 +426,10 @@ show_menu() {
   5) 安裝 .deb（dpkg -i）          【GitLab 伺服器】
   6) 設定 external_url 並 reconfigure 【GitLab 伺服器】
   7) 顯示 root 初始密碼            【GitLab 伺服器】
-  8) 說明
-  9) 常見問題排查
+  8) 啟用 HTTPS（自簽憑證）        【GitLab 伺服器】
+  9) 停用 HTTPS                    【GitLab 伺服器】
+  10) 說明
+  11) 常見問題排查
   q) 離開
 TXT
 }
@@ -350,8 +443,10 @@ dispatch() {
         5) install_deb ;;
         6) set_external_url ;;
         7) show_initial_password ;;
-        8) show_help ;;
-        9) show_troubleshooting ;;
+        8) enable_https ;;
+        9) disable_https ;;
+        10) show_help ;;
+        11) show_troubleshooting ;;
         *) echo "✗ 無此選項：$1" >&2 ;;
     esac
 }

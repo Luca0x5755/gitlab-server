@@ -152,6 +152,7 @@ setup_sandbox() { # setup_sandbox <名稱>
     make_stub "$SB/bin" scp 'exit "${STUB_SCP_RC:-0}"'
     make_stub "$SB/bin" dpkg 'if [ "$1" = "--print-architecture" ]; then echo "${STUB_ARCH:-amd64}"; fi; exit "${STUB_DPKG_RC:-0}"'
     make_stub "$SB/bin" gitlab-ctl 'if [ "$1" = reconfigure ]; then cp "$GITLAB_RB" "$SNAP"; exit "${STUB_RECONF_RC:-0}"; fi'
+    make_stub "$SB/bin" ufw 'exit "${STUB_UFW_RC:-0}"'
     make_stub "$SB/bin" chmod '[ -z "${STUB_CHMOD_FAIL:-}" ] || exit 1; exec /usr/bin/chmod "$@"'
 }
 
@@ -188,11 +189,11 @@ done <<<"$menu"
 assert_eq "0" "$bad" "每個動作項目都標示機器"
 assert_contains "$menu" "【有網路的電腦】" "選單有【有網路的電腦】項目"
 assert_contains "$menu" "【GitLab 伺服器】" "選單有【GitLab 伺服器】項目"
-help="$(run_ins '8\nq\n')"
+help="$(run_ins '10\nq\n')"
 for k in "Ubuntu 24.04" Noble "apt download" scp "24 小時" initial_root_password reconfigure dpkg; do
     assert_contains "$help" "$k" "說明含：$k"
 done
-fix="$(run_ins '9\nq\n')"
+fix="$(run_ins '11\nq\n')"
 for k in 相依 備份 initial_root_password reconfigure noble; do
     assert_contains "$fix" "$k" "排查含：$k"
 done
@@ -409,3 +410,121 @@ setup_sandbox pw_nogl
 rmdir "$SB/opt"
 out="$(run_ins '7\nq\n')"
 assert_contains "$out" "【GitLab 伺服器】" "尚未安裝 GitLab：指向【GitLab 伺服器】"
+
+# ══ ISSUE-004 HTTPS（PR-INS-06）══
+
+# ── render_https_block／external_url_host ──
+assert_eq $'external_url \'https://192.168.9.129\'\nnginx[\'redirect_http_to_https\'] = true' "$(render_https_block 192.168.9.129)" "IP 的 HTTPS 區塊"
+assert_eq $'external_url \'https://gitlab.example.com\'\nnginx[\'redirect_http_to_https\'] = true' "$(render_https_block gitlab.example.com)" "網域的 HTTPS 區塊"
+for h in "" "a'b" "a b" 999.1.1.1 "http://x"; do assert_nonzero "HTTPS 區塊拒絕：[$h]" render_https_block "$h"; done
+assert_eq "192.168.9.129" "$(external_url_host http://192.168.9.129)" "external_url_host：IP"
+assert_eq "gitlab.example.com" "$(external_url_host https://gitlab.example.com:8443)" "external_url_host：去掉 port"
+assert_nonzero "external_url_host：不合法" external_url_host "http://a/b"
+
+# ── 行程層級 ──
+SSL_ARGS=()
+run_https() { # run_https <stdin> [環境變數…]：把憑證目錄導到沙盒
+    local input="$1"
+    shift
+    run_ins "$input" GITLAB_SSL_DIR="$SB/ssl" "$@"
+}
+setup_sandbox https_ok
+out="$(run_https '8\n192.168.9.129\nq\n')"
+{ cat "$SB/gitlab.rb.orig"; printf '# >>> gitlab-ops:install_https BEGIN 腳本維護，重跑整段取代，請勿手改\nexternal_url '"'"'https://192.168.9.129'"'"'\nnginx['"'"'redirect_http_to_https'"'"'] = true\n# <<< gitlab-ops:install_https END\n'; } >"$SB/want"
+assert_file_eq "$SB/want" "$SB/gitlab.rb" "HTTPS 區塊追加在檔尾，區塊外 byte 不變"
+assert_file_eq "$SB/want" "$SNAP" "reconfigure 當下 gitlab.rb 已含 HTTPS 區塊"
+assert_eq "yes" "$([ -f "$SB/ssl/192.168.9.129.crt" ] && [ -f "$SB/ssl/192.168.9.129.key" ] && echo yes || echo no)" "憑證與私鑰已產生"
+assert_contains "$(openssl x509 -in "$SB/ssl/192.168.9.129.crt" -noout -text)" "IP Address:192.168.9.129" "憑證含 IP SAN"
+assert_eq "1" "$(count_log '^ufw allow 443/tcp')" "ufw allow 443/tcp 恰一次"
+assert_eq "1" "$(count_log '^gitlab-ctl reconfigure')" "reconfigure 恰一次"
+assert_contains "$out" "HTTPS 已啟用" "成功訊息"
+assert_contains "$(cat "$OPS_ENV_FILE")" "INS_HTTPS_HOST=192.168.9.129" "主機存入參數檔"
+
+# 預設取自先前設定的 external_url：直接 Enter 即可
+setup_sandbox https_default
+printf 'INS_EXTERNAL_URL=http://10.20.30.40\n' >"$OPS_ENV_FILE"
+out="$(run_https '8\n\nq\n')"
+assert_contains "$(cat "$SB/gitlab.rb")" "external_url 'https://10.20.30.40'" "預設主機取自 INS_EXTERNAL_URL"
+
+# 網域
+setup_sandbox https_dns
+out="$(run_https '8\ngitlab.example.com\nq\n')"
+assert_contains "$(openssl x509 -in "$SB/ssl/gitlab.example.com.crt" -noout -text)" "DNS:gitlab.example.com" "網域憑證含 DNS SAN"
+
+# 重跑：區塊只有一段；已有憑證回答 no 則沿用（檔案不變）
+cp "$SB/ssl/gitlab.example.com.crt" "$SB/crt.before"
+out="$(run_https '8\ngitlab.example.com\nno\nq\n')"
+assert_eq "1" "$(grep -c 'gitlab-ops:install_https BEGIN' "$SB/gitlab.rb")" "重跑仍只有一段 HTTPS 區塊"
+assert_file_eq "$SB/crt.before" "$SB/ssl/gitlab.example.com.crt" "已有憑證回答 no：沿用不覆蓋"
+out="$(run_https '8\ngitlab.example.com\nyes\nq\n')"
+assert_eq "no" "$(cmp -s "$SB/crt.before" "$SB/ssl/gitlab.example.com.crt" && echo same || echo no)" "已有憑證回答 yes：重新產生"
+
+# 不合法主機：不產生、不動 gitlab.rb、不 reconfigure
+setup_sandbox https_bad
+out="$(run_https "8\na;b\n999.1.1.1\n")"
+assert_file_eq "$SB/gitlab.rb.orig" "$SB/gitlab.rb" "主機不合法：gitlab.rb 不動"
+assert_eq "0" "$(count_log '^gitlab-ctl')" "主機不合法：不 reconfigure"
+assert_eq "0" "$(count_log '^ufw')" "主機不合法：不動防火牆"
+
+# reconfigure 失敗：不開 443
+setup_sandbox https_reconf_fail
+out="$(run_https '8\n192.168.9.129\nyes\nq\n' STUB_RECONF_RC=1)"
+assert_eq "0" "$(count_log '^ufw')" "reconfigure 失敗：不開 443"
+assert_not_contains "$out" "HTTPS 已啟用" "reconfigure 失敗：不宣稱成功"
+assert_contains "$out" "動作未完成" "reconfigure 失敗：動作回報失敗"
+
+# ufw 失敗：只警告，HTTPS 本身仍算完成
+setup_sandbox https_ufw_fail
+out="$(run_https '8\n192.168.9.129\nq\n' STUB_UFW_RC=1)"
+assert_contains "$out" "手動放行 443" "ufw 失敗：提示手動放行"
+assert_not_contains "$out" "動作未完成" "ufw 失敗：不算動作失敗"
+
+# 沒有 ufw：警告
+setup_sandbox https_no_ufw
+rm -f "$SB/bin/ufw"
+out="$(run_https '8\n192.168.9.129\nq\n')"
+if ! command -v ufw >/dev/null 2>&1; then assert_contains "$out" "找不到 ufw" "沒有 ufw：警告"; fi
+
+# 非 root／未裝 GitLab
+setup_sandbox https_nonroot
+out="$(run_https '8\n192.168.9.129\nq\n' OPS_FAKE_UID=1000)"
+assert_file_eq "$SB/gitlab.rb.orig" "$SB/gitlab.rb" "非 root：gitlab.rb 不動"
+assert_eq "no" "$([ -e "$SB/ssl/192.168.9.129.crt" ] && echo yes || echo no)" "非 root：不產生憑證"
+setup_sandbox https_nogl
+rmdir "$SB/opt"
+out="$(run_https '8\n192.168.9.129\nq\n')"
+assert_contains "$out" "【GitLab 伺服器】" "未裝 GitLab：指向【GitLab 伺服器】"
+
+# 選單 6 與 HTTPS 的一致性：HTTPS 啟用期間拒絕改 external_url
+setup_sandbox https_vs_url
+out="$(run_https '8\n192.168.9.129\nq\n')"
+cp "$SB/gitlab.rb" "$SB/after_https"
+: >"$STUB_LOG"
+out="$(run_https '6\nhttp://192.168.9.129\nq\n')"
+assert_file_eq "$SB/after_https" "$SB/gitlab.rb" "HTTPS 啟用中：選單 6 不改 gitlab.rb"
+assert_eq "0" "$(count_log '^gitlab-ctl')" "HTTPS 啟用中：選單 6 不 reconfigure"
+assert_contains "$out" "停用 HTTPS" "HTTPS 啟用中：選單 6 指向停用 HTTPS"
+
+# 停用 HTTPS
+out="$(run_https '9\nyes\nq\n')"
+assert_file_eq "$SB/gitlab.rb.orig" "$SB/gitlab.rb" "停用：區塊移除，回到原檔"
+assert_eq "1" "$(count_log '^gitlab-ctl reconfigure')" "停用：reconfigure 一次"
+assert_contains "$out" "已停用 HTTPS" "停用成功訊息"
+: >"$STUB_LOG"
+out="$(run_https '9\nq\n')"
+assert_contains "$out" "未由本腳本啟用" "沒有 HTTPS 區塊：不需處理"
+assert_eq "0" "$(count_log '^gitlab-ctl')" "沒有 HTTPS 區塊：不 reconfigure"
+setup_sandbox https_off_eof
+run_https '8\n192.168.9.129\nq\n' >/dev/null
+: >"$STUB_LOG"
+cp "$SB/gitlab.rb" "$SB/with_https"
+out="$(run_https '9\n')"
+assert_file_eq "$SB/with_https" "$SB/gitlab.rb" "停用遇 EOF（未確認）：不動"
+
+# 選單與說明
+menu="$(run_ins 'q\n')"
+assert_contains "$menu" "HTTPS" "選單含 HTTPS 項目"
+help="$(run_ins '10\nq\n')"
+for k in HTTPS subjectAltName 443 ; do assert_contains "$help" "$k" "說明含：$k"; done
+fix="$(run_ins '11\nq\n')"
+for k in 443 自簽 /etc/gitlab/ssl; do assert_contains "$fix" "$k" "排查含：$k"; done
