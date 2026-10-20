@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # GitLab 備份選單腳本：立即備份、列出備份、設定資料備份保留 7 天、註冊／移除 crontab、
-# 複製設定備份離機。只有互動選單，不收參數。來源文件：docs/02-backup-and-restore.md
-# 前半（建立與清理）；說明與排查內容併入本檔。還原由後續票（ISSUE-007）在本檔追加。
+# 複製設定備份離機、還原與還原後驗證。只有互動選單，不收參數。
+# 來源文件：docs/02-backup-and-restore.md；說明與排查內容併入本檔。
 # 真正做備份的是 backup_auto.sh（cron、升級前、本選單共用同一份）。
 #
 # 頂層只定義函式，不執行任何動作；`set -euo pipefail` 與 `cd` 都在 main 內，
 # 所以測試可以 source 本檔取得函式而不啟動選單。
 #
 # 可由環境變數覆寫的路徑（供測試用，預設為正式路徑；它們不是命令列參數）：
-#   GITLAB_RB、GITLAB_BACKUP_DIR、GITLAB_CONFIG_BACKUP_DIR、BACKUP_AUTO_LOG、GITLAB_OPT_DIR。
+#   GITLAB_RB、GITLAB_BACKUP_DIR、GITLAB_CONFIG_BACKUP_DIR、BACKUP_AUTO_LOG、GITLAB_OPT_DIR、
+#   GITLAB_RESTORE_ROOT（設定備份解開的根目錄，預設 /）。
 
 _bk_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
@@ -75,6 +76,67 @@ path_within() {
     [ "$p" = "$d" ] || [[ $p == "$d"/* ]]
 }
 
+# ── 還原（純函式）────────────────────────────────────────────────────────────
+
+# 資料備份檔名 → 備份 ID（還原時 BACKUP= 後面接的字串）。
+# 取 basename（不含路徑），去掉 _gitlab_backup.tar 後綴；剩下必須是
+# <時間戳>_<YYYY>_<MM>_<DD>_<版本>，版本可帶 -ce／-ee。不符回非 0 且不輸出。
+backup_id_from_name() {
+    local base="${1##*/}" id re='^[0-9]+_[0-9]{4}_[0-9]{2}_[0-9]{2}_[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9]+)?$'
+    [[ $base == *_gitlab_backup.tar ]] || return 1
+    id="${base%_gitlab_backup.tar}"
+    [[ $id =~ $re ]] || return 1
+    printf '%s\n' "$id"
+}
+
+# 備份 ID → 版本部分（例 1776235587_2026_04_15_18.7.6 → 18.7.6；帶 -ce／-ee 時保留）。
+backup_id_version() {
+    local re='^[0-9]+_[0-9]{4}_[0-9]{2}_[0-9]{2}_(.+)$'
+    [[ $1 =~ $re ]] || return 1
+    printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+# 已裝套件版本（dpkg 的 Version，例 18.7.6-ce.0）是否與備份 ID 的版本一致（PR-BAK-05）。
+# 只比 主.次.修；已裝必須是 CE（-ce.N）；備份 ID 帶 -ee 即視為不同類型。不一致回非 0 並在 stderr 說明。
+restore_version_check() { # restore_version_check <備份 ID> <已裝套件版本>
+    local bver core re='^([0-9]+\.[0-9]+\.[0-9]+)-ce\.[0-9]+$'
+    bver="$(backup_id_version "$1")" || { echo "✗ 備份 ID 格式不符：$1" >&2; return 1; }
+    if [[ $2 =~ $re ]]; then
+        core="${BASH_REMATCH[1]}"
+    else
+        echo "✗ 已安裝的版本「$2」不是 GitLab CE（x.y.z-ce.N）。備份與目標的版本及類型 (CE/EE) 必須完全一致。" >&2
+        return 1
+    fi
+    if [ "$bver" = "$core" ] || [ "$bver" = "$core-ce" ]; then
+        return 0
+    fi
+    echo "✗ 版本不一致：備份是 $bver，這台已安裝 $2。請先安裝與備份相同的 GitLab 版本（CE）再還原。" >&2
+    return 1
+}
+
+# 設定備份 tar 的內容列表（stdin，一行一條目）是否安全：每條都必須在 etc/gitlab 之下，
+# 不得絕對路徑、不得含 .. 。空列表視為不安全。
+config_tar_entries_ok() {
+    local line n=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        n=$((n + 1))
+        line="${line#./}"
+        [[ $line == "etc/gitlab" || $line == etc/gitlab/* ]] || return 1
+        [[ /$line/ != */../* ]] || return 1
+    done
+    [ "$n" -gt 0 ]
+}
+
+# 還原後的五項驗證（依序）：每行「說明<TAB>rake 參數…」。
+restore_verify_tasks() {
+    printf '%s\t%s\n' \
+        "gitlab:check" "gitlab:check SANITIZE=true" \
+        "gitlab:doctor:secrets" "gitlab:doctor:secrets" \
+        "gitlab:artifacts:check" "gitlab:artifacts:check" \
+        "gitlab:lfs:check" "gitlab:lfs:check" \
+        "gitlab:uploads:check" "gitlab:uploads:check"
+}
+
 render_keep_time_block() { echo "gitlab_rails['backup_keep_time'] = 604800"; }
 
 # ── 系統 crontab 的薄包裝（獨立成函式讓測試能覆寫）──────────────────────────
@@ -90,6 +152,9 @@ read_crontab() {
     printf '%s' "$out"
 }
 write_crontab() { printf '%s' "$1" | crontab -; }
+
+# 已裝的 gitlab-ce 套件版本；獨立成函式讓測試能換掉。
+installed_gitlab_pkg_version() { dpkg-query -W -f='${Version}\n' gitlab-ce; }
 
 # ── 說明與排查 ───────────────────────────────────────────────────────────────
 
@@ -118,6 +183,22 @@ show_help() {
     選單 3 以管理區塊寫入並 reconfigure；GitLab 於每次建立資料備份時清理過期檔案。
   - 設定備份同樣保留 7 天，由 backup_auto.sh 在每次備份後清理。
 
+還原（選單 7）——前置條件：
+  - 目標主機的 GitLab 版本與類型 (CE/EE) 必須與備份時完全一致（腳本會比對已裝版本與
+    資料備份檔名中的版本，不符即中止）。
+  - 目標主機已安裝 GitLab，且至少執行過一次 sudo gitlab-ctl reconfigure。
+  - 目標主機不應有既有的正式資料：還原會覆蓋（資料庫、儲存庫、附件，以及 /etc/gitlab 的設定與金鑰）。
+  - 準備好資料備份檔（*_gitlab_backup.tar）與設定備份檔（gitlab_config_*.tar）。
+  還原依序執行：還原設定備份並 reconfigure → 資料備份放入 /var/opt/gitlab/backups 並
+  chown git:git → 停 puma 與 sidekiq → gitlab-backup restore BACKUP=<備份 ID> →
+  reconfigure 與 start → 驗證。備份 ID 由檔名自動取出，只含 <時間戳>_<日期>_<版本>：
+    備份檔名：1776235587_2026_04_15_18.7.6_gitlab_backup.tar
+    備份 ID ：1776235587_2026_04_15_18.7.6   （不含路徑、不含 _gitlab_backup.tar）
+  還原前須輸入 yes。選單 8 可單獨重跑還原後驗證（gitlab:check SANITIZE=true、
+  gitlab:doctor:secrets、gitlab:artifacts:check、gitlab:lfs:check、gitlab:uploads:check）。
+  驗證之外，還請：登入 Web 介面確認帳號與專案存在、隨機 clone 一個專案確認 Git 資料完整、
+  確認 CI/CD 變數與 Runner 等設定正常。
+
 自動備份：選單 4 把 backup_auto.sh 註冊進 root 的 crontab（預設每天 02:00），
   重複註冊只會留下一筆；輸出記在 /var/log/gitlab_backup.log。選單 5 移除。
   backup_auto.sh 先資料備份、再設定備份；資料備份失敗即以非 0 結束。
@@ -141,6 +222,17 @@ show_troubleshooting() {
   複製設定備份被拒絕：目的地不得位於資料備份目錄（/var/opt/gitlab/backups）之下，
     也不能就是設定備份目錄本身。
   複製出去的設定備份只有 root 可讀（保留原本的權限）；放在共享目錄時請確認其他人讀不到。
+  還原（選單 7）排查：
+    「版本不一致」：先安裝與備份相同版本的 gitlab-ce（install.sh 或 dpkg -i），再重跑。
+    「備份 ID 格式不符」：檔名須為 <時間戳>_<日期>_<版本>_gitlab_backup.tar，不要改檔名。
+    gitlab-backup restore 說找不到備份：確認檔案在 /var/opt/gitlab/backups、擁有者 git:git，
+      且 BACKUP= 只填 ID（不含路徑、不含 _gitlab_backup.tar）。
+    設定備份被拒絕：內容必須全在 etc/gitlab 之下（backup-etc 產生的才符合）。
+    還原中途失敗：puma 與 sidekiq 此時是停止的；排除原因後可重跑選單 7，
+      或手動 sudo gitlab-ctl start 恢復服務。
+    驗證 gitlab:doctor:secrets 失敗：設定備份與資料備份不是同一時間的一組，
+      gitlab-secrets.json 解不開資料；請改用同一次備份的設定備份。
+    驗證 gitlab:check 有 FAILED：照其輸出修正；剛 reconfigure 完幾分鐘內的暫時失敗可重跑選單 8。
 TXT
 }
 
@@ -248,6 +340,101 @@ copy_config_backups() {
     [ "$n" -gt 0 ] || [ "$skipped" -gt 0 ] || echo "  （$src 裡沒有設定備份，請先執行選單 1。）"
 }
 
+# 在資料備份／設定備份目錄裡找最新的檔案（預設值用）；沒有回空。
+newest_file() { # newest_file <目錄> <樣式>
+    find "$1" -maxdepth 1 -type f -name "$2" -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2-
+}
+
+# 還原後驗證：五項各自執行並彙總，不因單項失敗而中止。任一失敗回非 0。
+verify_restore() {
+    local label args ok=() bad=() line rc
+    require_machine server
+    have_cmd gitlab-rake || die "找不到 gitlab-rake。"
+    while IFS=$'\t' read -r label args; do
+        echo "── gitlab-rake $args ──"
+        rc=0
+        # shellcheck disable=SC2086  # args 是固定的任務名稱加 SANITIZE=true，需要依空白拆開
+        gitlab-rake $args || rc=$?
+        if [ "$rc" -eq 0 ]; then ok+=("$label"); else bad+=("$label"); fi
+    done < <(restore_verify_tasks)
+    echo "── 驗證彙總 ──"
+    for line in "${ok[@]}"; do echo "  ✓ $line"; done
+    for line in "${bad[@]}"; do echo "  ✗ $line"; done
+    if [ "${#bad[@]}" -gt 0 ]; then
+        echo "✗ ${#bad[@]} 項驗證失敗，見上方輸出與「常見問題排查」。" >&2
+        return 1
+    fi
+    echo "✓ 五項驗證全部通過。請再登入 Web 介面、clone 專案、確認 CI/CD 變數與 Runner。"
+}
+
+restore_backup() {
+    local data conf id pkg_ver dest root f
+    require_machine server
+    require_root
+    have_cmd gitlab-backup || die "找不到 gitlab-backup。"
+    have_cmd gitlab-ctl || die "找不到 gitlab-ctl。"
+    have_cmd dpkg-query || die "找不到 dpkg-query。"
+    have_cmd tar || die "找不到 tar。"
+    conf="$(ask_param RST_CONFIG_TAR "設定備份檔完整路徑（gitlab_config_*.tar）" "$(newest_file "$(config_backup_dir)" 'gitlab_config_*.tar')" valid_local_path)"
+    data="$(ask_param RST_DATA_TAR "資料備份檔完整路徑（*_gitlab_backup.tar）" "$(newest_file "$(data_backup_dir)" '*_gitlab_backup.tar')" valid_local_path)"
+    [ -f "$conf" ] || die "找不到設定備份檔：$conf"
+    [ -f "$data" ] || die "找不到資料備份檔：$data"
+    id="$(backup_id_from_name "$data")" \
+        || die "資料備份檔名不符（須為 <時間戳>_<日期>_<版本>_gitlab_backup.tar）：${data##*/}。請勿改檔名。"
+    pkg_ver="$(installed_gitlab_pkg_version)" || die "讀不到已安裝的 gitlab-ce 版本。請先安裝與備份相同版本的 GitLab CE。"
+    restore_version_check "$id" "$pkg_ver" || die "版本檢查未通過，未做任何變更。"
+    tar -tf "$conf" | config_tar_entries_ok \
+        || die "設定備份檔內容不安全或不是 backup-etc 的產物（條目須全在 etc/gitlab 之下）：$conf"
+
+    cat <<TXT
+即將還原（備份 ID：$id，已安裝版本 $pkg_ver，版本一致）：
+  設定備份：$conf
+  資料備份：$data
+⚠ 這會覆蓋這台主機上：
+  - /etc/gitlab 的設定與金鑰（gitlab.rb、gitlab-secrets.json、ssl、trusted-certs…）
+  - GitLab 的全部資料：資料庫、儲存庫、附件、Wiki…
+  目標主機不應有需要保留的正式資料。
+TXT
+    confirm "確定要還原？" || { echo "已取消，未做任何變更。"; return 0; }
+
+    root="${GITLAB_RESTORE_ROOT:-/}"
+    echo "── ① 還原設定與金鑰 ──"
+    if [ -f "$(gitlab_rb_file)" ]; then backup_gitlab_rb || die "備份現有 gitlab.rb 失敗，中止。"; fi
+    tar -xvf "$conf" -C "$root" || die "解開設定備份失敗。"
+    gitlab_reconfigure || die "設定備份還原後 reconfigure 失敗，中止（資料備份尚未還原）。"
+
+    echo "── ② 放入備份目錄並 chown git:git ──"
+    dest="$(data_backup_dir)"
+    mkdir -p "$dest" || die "無法建立 $dest。"
+    f="$dest/${data##*/}"
+    if [ "$data" -ef "$f" ]; then
+        echo "  備份檔已在 $dest，不需複製。"
+    else
+        cp -- "$data" "$f" || die "複製資料備份到 $dest 失敗。"
+    fi
+    chown git:git -- "$f" || die "chown git:git 失敗：$f"
+
+    echo "── ③ 停止寫入相關服務 ──"
+    gitlab-ctl stop puma || die "停止 puma 失敗。"
+    gitlab-ctl stop sidekiq || die "停止 sidekiq 失敗。"
+    gitlab-ctl status || true
+
+    echo "── ④ 執行還原（BACKUP=$id）──"
+    if ! gitlab-backup restore "BACKUP=$id" force=yes; then
+        echo "✗ gitlab-backup restore 失敗。puma 與 sidekiq 目前是停止的；排除原因後可重跑本項，" >&2
+        echo "  或執行 sudo gitlab-ctl start 恢復服務。" >&2
+        return 1
+    fi
+
+    echo "── ⑤ reconfigure 與啟動 ──"
+    gitlab_reconfigure || die "reconfigure 失敗。"
+    gitlab-ctl start || die "gitlab-ctl start 失敗。"
+    gitlab-ctl status || true
+
+    echo "── ⑥ 驗證 ──"
+    verify_restore
+}
+
 # ── 選單 ─────────────────────────────────────────────────────────────────────
 
 show_menu() {
@@ -259,8 +446,10 @@ show_menu() {
   4) 註冊自動備份到 crontab           【GitLab 伺服器】
   5) 移除 crontab 的自動備份          【GitLab 伺服器】
   6) 複製設定備份到指定目錄           【GitLab 伺服器】
-  7) 說明
-  8) 常見問題排查
+  7) 還原（會覆蓋現有資料）           【GitLab 伺服器】
+  8) 還原後驗證（五項 rake 檢查）     【GitLab 伺服器】
+  9) 說明
+  10) 常見問題排查
   q) 離開
 TXT
 }
@@ -273,8 +462,10 @@ dispatch() {
         4) register_cron ;;
         5) unregister_cron ;;
         6) copy_config_backups ;;
-        7) show_help ;;
-        8) show_troubleshooting ;;
+        7) restore_backup ;;
+        8) verify_restore ;;
+        9) show_help ;;
+        10) show_troubleshooting ;;
         *) echo "✗ 無此選項：$1" >&2 ;;
     esac
 }

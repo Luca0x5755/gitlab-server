@@ -77,9 +77,12 @@ setup_sandbox() { # setup_sandbox <名稱>
     cp "$RB_DEFAULT" "$SB/gitlab.rb"
     cp "$SB/gitlab.rb" "$SB/gitlab.rb.orig"
     rm -f "$OPS_ENV_FILE"
-    make_stub "$SB/bin" gitlab-backup '[ "${STUB_BACKUP_RC:-0}" -eq 0 ] || exit "$STUB_BACKUP_RC"; : >"'"$SB"'/data/1776235587_2026_04_15_18.7.6_gitlab_backup.tar"'
+    make_stub "$SB/bin" gitlab-backup 'if [ "$1" = restore ]; then exit "${STUB_RESTORE_RC:-0}"; fi; [ "${STUB_BACKUP_RC:-0}" -eq 0 ] || exit "$STUB_BACKUP_RC"; : >"'"$SB"'/data/1776235587_2026_04_15_18.7.6_gitlab_backup.tar"'
     make_stub "$SB/bin" gitlab-ctl 'if [ "$1" = reconfigure ]; then cp "$GITLAB_RB" "$SNAP"; exit "${STUB_RECONF_RC:-0}"; fi; if [ "$1" = backup-etc ]; then [ "${STUB_ETC_RC:-0}" -eq 0 ] || exit "$STUB_ETC_RC"; : >"'"$SB"'/cfg/gitlab_config_1776235587_2026_04_15.tar"; fi'
     make_stub "$SB/bin" apt 'exit 0'
+    make_stub "$SB/bin" dpkg-query 'if [ -n "${STUB_NOPKG:-}" ]; then exit 1; fi; echo "${STUB_PKG_VERSION:-18.7.6-ce.0}"'
+    make_stub "$SB/bin" chown 'exit "${STUB_CHOWN_RC:-0}"'
+    make_stub "$SB/bin" gitlab-rake 'case " ${STUB_RAKE_FAIL:-} " in *" $1 "*) exit 1 ;; esac; exit 0'
     # crontab 假指令：-l 讀檔（無檔時照真的 crontab 輸出 no crontab 並回 1），- 由 stdin 寫檔
     make_stub "$SB/bin" crontab 'case "$1" in -l) if [ -n "${STUB_CRON_ERR:-}" ]; then echo "$STUB_CRON_ERR" >&2; exit 1; fi; if [ -f "$CRON_FILE" ]; then cat "$CRON_FILE"; else echo "no crontab for root" >&2; exit 1; fi ;; -) cat >"$CRON_FILE" ;; esac'
 }
@@ -161,11 +164,11 @@ while IFS= read -r line; do
     [[ $line == *"【有網路的電腦】"* || $line == *"【GitLab 伺服器】"* ]] || { bad=1; echo "未標示：$line" >&2; }
 done <<<"$menu"
 assert_eq "0" "$bad" "每個動作項目都標示機器"
-help="$(run_bk '7\nq\n')"
+help="$(run_bk '9\nq\n')"
 for k in "Object Storage" Mattermost Redis "server hooks" 不同 "604800" "gitlab-ctl backup-etc" "/etc/gitlab/config_backup" crontab; do
     assert_contains "$help" "$k" "說明含：$k"
 done
-fix="$(run_bk '8\nq\n')"
+fix="$(run_bk '10\nq\n')"
 for k in 空間 backup-etc crontab backup_keep_time /var/log/gitlab_backup.log; do
     assert_contains "$fix" "$k" "排查含：$k"
 done
@@ -288,3 +291,201 @@ assert_eq "no" "$([ -d "$SB/offsite" ] && echo yes || echo no)" "非 root：不�
 assert_eq "no" "$([ -e "$repo/scripts/gitlab_backup.sh" ] && echo yes || echo no)" "舊的 gitlab_backup.sh 已改名"
 assert_eq "no" "$(grep -q 'gitlab_backup\.sh' "$repo/README.md" && echo yes || echo no)" "README 不再提 gitlab_backup.sh"
 assert_contains "$(cat "$repo/README.md")" "backup_auto.sh" "README 指向 backup_auto.sh"
+
+# ══ ISSUE-007 還原（PR-BAK-05～09）══
+
+# ── backup_id_from_name：含路徑、含後綴、含版本號（文件強調的常見出錯點）──
+ID=1776235587_2026_04_15_18.7.6
+assert_eq "$ID" "$(backup_id_from_name 1776235587_2026_04_15_18.7.6_gitlab_backup.tar)" "純檔名 → ID"
+assert_eq "$ID" "$(backup_id_from_name /var/opt/gitlab/backups/1776235587_2026_04_15_18.7.6_gitlab_backup.tar)" "含絕對路徑 → ID 不含路徑"
+assert_eq "$ID" "$(backup_id_from_name ./dl/sub/1776235587_2026_04_15_18.7.6_gitlab_backup.tar)" "含相對路徑 → ID 不含路徑"
+assert_eq "1493107454_2018_04_25_10.6.4-ce" "$(backup_id_from_name 1493107454_2018_04_25_10.6.4-ce_gitlab_backup.tar)" "版本帶 -ce 時保留"
+assert_not_contains "$(backup_id_from_name /x/$ID'_gitlab_backup.tar')" "gitlab_backup" "ID 不含 _gitlab_backup.tar 後綴"
+assert_not_contains "$(backup_id_from_name /x/$ID'_gitlab_backup.tar')" "/" "ID 不含斜線"
+for n in "" foo.tar "${ID}_gitlab_backup.tar.gz" "${ID}.tar" "${ID}_gitlab_backup.tar.bak" "abc_2026_04_15_18.7.6_gitlab_backup.tar" "1776235587_2026_04_15_gitlab_backup.tar" "1776235587_2026_4_15_18.7.6_gitlab_backup.tar" "gitlab_backup.tar" "${ID};id_gitlab_backup.tar" "1776235587_2026_04_15_18.7_gitlab_backup.tar"; do
+    assert_nonzero "非法備份檔名：[$n]" backup_id_from_name "$n"
+done
+assert_eq "18.7.6" "$(backup_id_version $ID)" "ID → 版本"
+assert_eq "10.6.4-ce" "$(backup_id_version 1493107454_2018_04_25_10.6.4-ce)" "ID → 版本（帶 -ce）"
+assert_nonzero "非法 ID 取不到版本" backup_id_version "nonsense"
+
+# ── restore_version_check（PR-BAK-05）──
+assert_status 0 "版本一致" restore_version_check "$ID" 18.7.6-ce.0
+assert_status 0 "版本一致（-ce.1 修訂不影響）" restore_version_check "$ID" 18.7.6-ce.1
+assert_status 0 "ID 帶 -ce 且一致" restore_version_check 1493107454_2018_04_25_10.6.4-ce 10.6.4-ce.0
+assert_nonzero "修訂號不同" restore_version_check "$ID" 18.7.7-ce.0
+assert_nonzero "次版本不同" restore_version_check "$ID" 18.8.6-ce.0
+assert_nonzero "主版本不同" restore_version_check "$ID" 17.7.6-ce.0
+assert_nonzero "18.7.6 不等於 18.7.60" restore_version_check "$ID" 18.7.60-ce.0
+assert_nonzero "ID 是 -ee：與 CE 不符" restore_version_check 1493107454_2018_04_25_10.6.4-ee 10.6.4-ce.0
+assert_nonzero "已裝是 EE" restore_version_check "$ID" 18.7.6-ee.0
+assert_nonzero "已裝版本格式怪異" restore_version_check "$ID" "garbage"
+assert_nonzero "ID 非法" restore_version_check "bad" 18.7.6-ce.0
+assert_contains "$(restore_version_check "$ID" 17.0.0-ce.0 2>&1)" "17.0.0-ce.0" "不一致訊息列出已裝版本"
+assert_contains "$(restore_version_check "$ID" 17.0.0-ce.0 2>&1)" "18.7.6" "不一致訊息列出備份版本"
+
+# ── config_tar_entries_ok ──
+assert_status 0 "etc/gitlab 之下全部 OK" bash -c ". '$bk'; printf 'etc/gitlab/\netc/gitlab/gitlab.rb\netc/gitlab/trusted-certs/\netc/gitlab/ssl/a.crt\n' | config_tar_entries_ok"
+assert_status 0 "./ 開頭也 OK" bash -c ". '$bk'; printf './etc/gitlab/gitlab.rb\n' | config_tar_entries_ok"
+assert_nonzero "絕對路徑被拒" bash -c ". '$bk'; printf '/etc/gitlab/gitlab.rb\n' | config_tar_entries_ok"
+assert_nonzero "含 .. 被拒" bash -c ". '$bk'; printf 'etc/gitlab/../passwd\n' | config_tar_entries_ok"
+assert_nonzero "etc/gitlab 之外被拒" bash -c ". '$bk'; printf 'etc/gitlab/a\netc/shadow\n' | config_tar_entries_ok"
+assert_nonzero "etc/gitlab-evil 被拒" bash -c ". '$bk'; printf 'etc/gitlab-evil/x\n' | config_tar_entries_ok"
+assert_nonzero "空列表被拒" bash -c ". '$bk'; printf '' | config_tar_entries_ok"
+assert_nonzero ".. 結尾被拒" bash -c ". '$bk'; printf 'etc/gitlab/..\n' | config_tar_entries_ok"
+
+# ── restore_verify_tasks：五項、順序固定 ──
+assert_eq $'gitlab:check\tgitlab:check SANITIZE=true\ngitlab:doctor:secrets\tgitlab:doctor:secrets\ngitlab:artifacts:check\tgitlab:artifacts:check\ngitlab:lfs:check\tgitlab:lfs:check\ngitlab:uploads:check\tgitlab:uploads:check' "$(restore_verify_tasks)" "五項驗證依序"
+
+# ── 行程層級 ──
+CFGNAME=gitlab_config_1776235587_2026_04_15.tar
+mk_fixtures() { # 在 $SB/in 放設定備份與資料備份
+    mkdir -p "$SB/in" "$SB/stage/etc/gitlab/trusted-certs" "$SB/root"
+    printf "external_url 'http://restored'\n" >"$SB/stage/etc/gitlab/gitlab.rb"
+    printf '{"restored":true}\n' >"$SB/stage/etc/gitlab/gitlab-secrets.json"
+    tar -cf "$SB/in/$CFGNAME" -C "$SB/stage" etc/gitlab
+    : >"$SB/in/${ID}_gitlab_backup.tar"
+}
+rst_in() { printf '7\\n%s\\n%s\\n%s\\n' "$SB/in/$CFGNAME" "$SB/in/${ID}_gitlab_backup.tar" "$1"; }   # 字面 \n：$(…) 會吃掉結尾換行，交給 run_bk 的 printf %b 展開
+run_rst() { # run_rst <stdin> [KEY=VAL…]
+    local input="$1"
+    shift
+    run_bk "$input" GITLAB_RESTORE_ROOT="$SB/root" "$@"
+}
+seq_of() { grep -E '^(gitlab-ctl|gitlab-backup|gitlab-rake|chown)' "$STUB_LOG" | tr '\n' '|'; }
+
+setup_sandbox rst_ok
+mk_fixtures
+out="$(run_rst "$(rst_in yes)q\n")"
+assert_eq "yes" "$(grep -q restored "$SB/root/etc/gitlab/gitlab.rb" && echo yes || echo no)" "① 設定備份已解開到根目錄"
+assert_eq "yes" "$([ -f "$SB/root/etc/gitlab/gitlab-secrets.json" ] && echo yes || echo no)" "① 金鑰檔也還原"
+want="gitlab-ctl reconfigure|chown git:git -- $SB/data/${ID}_gitlab_backup.tar|gitlab-ctl stop puma|gitlab-ctl stop sidekiq|gitlab-ctl status|gitlab-backup restore BACKUP=$ID force=yes|gitlab-ctl reconfigure|gitlab-ctl start|gitlab-ctl status|gitlab-rake gitlab:check SANITIZE=true|gitlab-rake gitlab:doctor:secrets|gitlab-rake gitlab:artifacts:check|gitlab-rake gitlab:lfs:check|gitlab-rake gitlab:uploads:check|"
+assert_eq "$want" "$(seq_of)" "指令順序：設定→reconfigure→chown→停服務→restore→reconfigure→start→五項驗證"
+assert_eq "yes" "$([ -f "$SB/data/${ID}_gitlab_backup.tar" ] && echo yes || echo no)" "② 資料備份已放入備份目錄"
+assert_contains "$(cat "$STUB_LOG")" "BACKUP=$ID " "BACKUP= 只有 ID"
+assert_not_contains "$(cat "$STUB_LOG")" "BACKUP=$SB" "BACKUP= 不含路徑"
+assert_not_contains "$(cat "$STUB_LOG")" "_gitlab_backup.tar force" "BACKUP= 不含 _gitlab_backup.tar 後綴"
+assert_contains "$out" "五項驗證全部通過" "成功彙總"
+assert_eq "yes" "$(ls "$SB"/gitlab.rb.bak-* >/dev/null 2>&1 && echo yes || echo no)" "還原設定前先備份現有 gitlab.rb"
+assert_contains "$out" "會覆蓋" "確認提示寫清楚會覆蓋什麼"
+assert_contains "$out" "資料庫" "確認提示提到資料庫"
+assert_contains "$out" "gitlab-secrets.json" "確認提示提到金鑰"
+
+# 還原前須 yes（PR-BAK-07）
+for ans in "no" "y" "YES" ""; do
+    setup_sandbox "rst_deny_$ans"
+    mk_fixtures
+    out="$(run_rst "$(rst_in "$ans")q\n")"
+    assert_eq "" "$(seq_of)" "回答「$ans」：沒有任何 gitlab 指令被執行"
+    assert_eq "no" "$(grep -q restored "$SB/root/etc/gitlab/gitlab.rb" 2>/dev/null && echo yes || echo no)" "回答「$ans」：設定未被還原"
+done
+setup_sandbox rst_eof
+mk_fixtures
+out="$(run_rst "$(rst_in '')")"
+assert_eq "" "$(seq_of)" "stdin EOF 視為否：沒有任何 gitlab 指令"
+
+# 版本不符即中止（PR-BAK-05）
+setup_sandbox rst_ver
+mk_fixtures
+out="$(run_rst "$(rst_in yes)q\n" STUB_PKG_VERSION=18.8.0-ce.0)"
+assert_eq "" "$(seq_of)" "版本不符：沒有任何 gitlab 指令"
+assert_eq "no" "$(grep -q restored "$SB/root/etc/gitlab/gitlab.rb" 2>/dev/null && echo yes || echo no)" "版本不符：設定未被還原"
+assert_contains "$out" "版本不一致" "版本不符：說明"
+assert_contains "$out" "動作未完成" "版本不符：回報失敗"
+setup_sandbox rst_nopkg
+mk_fixtures
+out="$(run_rst "$(rst_in yes)q\n" STUB_NOPKG=1)"
+assert_eq "" "$(seq_of)" "讀不到已裝版本：沒有任何 gitlab 指令"
+
+# 檔案與檔名檢查
+setup_sandbox rst_badname
+mk_fixtures
+mv "$SB/in/${ID}_gitlab_backup.tar" "$SB/in/renamed.tar"
+out="$(run_rst "7\n$SB/in/$CFGNAME\n$SB/in/renamed.tar\nyes\nq\n")"
+assert_eq "" "$(seq_of)" "資料備份被改名：不還原"
+assert_contains "$out" "請勿改檔名" "資料備份被改名：說明"
+setup_sandbox rst_nofile
+mk_fixtures
+out="$(run_rst "7\n$SB/in/$CFGNAME\n$SB/in/9999_2026_01_01_18.7.6_gitlab_backup.tar\nyes\nq\n")"
+assert_eq "" "$(seq_of)" "資料備份不存在：不還原"
+setup_sandbox rst_evil_tar
+mk_fixtures
+mkdir -p "$SB/evil/etc/gitlab" "$SB/evil/etc/cron.d"
+: >"$SB/evil/etc/cron.d/pwn"
+tar -cf "$SB/in/$CFGNAME" -C "$SB/evil" etc/gitlab etc/cron.d
+out="$(run_rst "$(rst_in yes)q\n")"
+assert_eq "" "$(seq_of)" "設定備份含 etc/gitlab 以外的條目：不還原"
+assert_eq "no" "$([ -e "$SB/root/etc/cron.d/pwn" ] && echo yes || echo no)" "惡意條目沒有被解開"
+assert_contains "$out" "不安全" "設定備份不安全：說明"
+
+# 已在備份目錄的資料備份：不重複複製
+setup_sandbox rst_inplace
+mk_fixtures
+mv "$SB/in/${ID}_gitlab_backup.tar" "$SB/data/"
+out="$(run_rst "7\n$SB/in/$CFGNAME\n$SB/data/${ID}_gitlab_backup.tar\nyes\nq\n")"
+assert_contains "$out" "不需複製" "資料備份已在備份目錄：不複製"
+assert_eq "1" "$(grep -c "^gitlab-backup restore" "$STUB_LOG")" "仍會執行還原"
+
+# 失敗路徑
+setup_sandbox rst_reconf1_fail
+mk_fixtures
+out="$(run_rst "$(rst_in yes)no\nq\n" STUB_RECONF_RC=1)"
+assert_eq "0" "$(grep -c '^gitlab-backup restore' "$STUB_LOG")" "設定還原後 reconfigure 失敗：不進行資料還原"
+assert_eq "0" "$(grep -c '^gitlab-ctl stop' "$STUB_LOG")" "設定還原後 reconfigure 失敗：不停服務"
+setup_sandbox rst_chown_fail
+mk_fixtures
+out="$(run_rst "$(rst_in yes)q\n" STUB_CHOWN_RC=1)"
+assert_eq "0" "$(grep -c '^gitlab-ctl stop' "$STUB_LOG")" "chown 失敗：不停服務"
+assert_eq "0" "$(grep -c '^gitlab-backup restore' "$STUB_LOG")" "chown 失敗：不還原"
+setup_sandbox rst_restore_fail
+mk_fixtures
+out="$(run_rst "$(rst_in yes)q\n" STUB_RESTORE_RC=1)"
+assert_contains "$out" "gitlab-backup restore 失敗" "restore 失敗：說明"
+assert_contains "$out" "gitlab-ctl start" "restore 失敗：告知如何恢復服務"
+assert_contains "$out" "動作未完成" "restore 失敗：回報失敗"
+assert_eq "0" "$(grep -c '^gitlab-rake' "$STUB_LOG")" "restore 失敗：不跑驗證"
+assert_eq "0" "$(grep -c '^gitlab-ctl start' "$STUB_LOG")" "restore 失敗：不自動啟動服務"
+setup_sandbox rst_nonroot
+mk_fixtures
+out="$(run_rst "$(rst_in yes)q\n" OPS_FAKE_UID=1000)"
+assert_eq "" "$(seq_of)" "非 root：沒有任何 gitlab 指令"
+
+# ── 還原後驗證（PR-BAK-08）──
+setup_sandbox ver_ok
+out="$(run_bk '8\nq\n')"
+assert_eq "5" "$(grep -c '^gitlab-rake' "$STUB_LOG")" "五項驗證都執行"
+assert_eq "gitlab-rake gitlab:check SANITIZE=true|gitlab-rake gitlab:doctor:secrets|gitlab-rake gitlab:artifacts:check|gitlab-rake gitlab:lfs:check|gitlab-rake gitlab:uploads:check|" "$(grep '^gitlab-rake' "$STUB_LOG" | tr '\n' '|')" "驗證順序"
+assert_contains "$out" "五項驗證全部通過" "全部通過：彙總"
+assert_not_contains "$out" "動作未完成" "全部通過：不報失敗"
+setup_sandbox ver_some_fail
+out="$(run_bk '8\nq\n' STUB_RAKE_FAIL="gitlab:doctor:secrets gitlab:lfs:check")"
+assert_eq "5" "$(grep -c '^gitlab-rake' "$STUB_LOG")" "有失敗仍跑完五項"
+assert_contains "$out" "✓ gitlab:check" "彙總：成功項"
+assert_contains "$out" "✗ gitlab:doctor:secrets" "彙總：失敗項（secrets）"
+assert_contains "$out" "✗ gitlab:lfs:check" "彙總：失敗項（lfs）"
+assert_contains "$out" "2 項驗證失敗" "彙總：失敗個數"
+assert_contains "$out" "動作未完成" "有失敗：整體回報失敗"
+assert_not_contains "$out" "全部通過" "有失敗：不宣稱通過"
+setup_sandbox rst_verify_fail
+mk_fixtures
+out="$(run_rst "$(rst_in yes)q\n" STUB_RAKE_FAIL="gitlab:uploads:check")"
+assert_contains "$out" "✗ gitlab:uploads:check" "還原流程內的驗證失敗也彙總"
+assert_contains "$out" "動作未完成" "還原流程驗證失敗：回報失敗"
+
+# ── 選單、說明、排查 ──
+setup_sandbox menu7
+menu="$(run_bk 'q\n')"
+assert_contains "$menu" "還原" "選單含還原"
+bad=0
+while IFS= read -r line; do
+    [[ $line =~ ^\ +[0-9]+\) ]] || continue
+    [[ $line == *"說明"* || $line == *"常見問題排查"* ]] && continue
+    [[ $line == *"【有網路的電腦】"* || $line == *"【GitLab 伺服器】"* ]] || { bad=1; echo "未標示：$line" >&2; }
+done <<<"$menu"
+assert_eq "0" "$bad" "還原項目也標示機器"
+help="$(run_bk '9\nq\n')"
+for k in "版本與類型" "reconfigure" "不應有既有的正式資料" "chown git:git" "備份 ID" "gitlab:doctor:secrets" "gitlab:artifacts:check" "gitlab:lfs:check" "gitlab:uploads:check" "clone" "CI/CD" "Runner" "yes"; do
+    assert_contains "$help" "$k" "說明含：$k"
+done
+fix="$(run_bk '10\nq\n')"
+for k in "版本不一致" "備份 ID 格式不符" "BACKUP=" "gitlab-ctl start" "etc/gitlab"; do assert_contains "$fix" "$k" "排查含：$k"; done
