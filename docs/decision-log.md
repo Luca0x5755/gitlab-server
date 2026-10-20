@@ -12,3 +12,4 @@
 - 2026-10-20 腳本完成後刪除 `docs/01`～`05`，全部內容（前置條件、注意事項、故障排查表、切換回內建 Nginx 等）併入對應腳本，各腳本以選單項目「說明」「常見問題排查」呈現；README 改指向腳本 — 單一事實來源，文件與腳本不再漂移（取代先前「文件縮成說明」的決定）。刪除須在腳本實作並試跑通過之後。
 - 2026-10-20 驗證採 `bash -n`、`shellcheck`、純函式的 bash 測試；`dpkg`／`netplan` 等真實動作靠 Ubuntu VM 試跑，不宣稱已驗證 — 本機為 Windows。
 - 2026-10-20 `network.sh` 的機器檢查只要求 Ubuntu 工具（`apt`、`netplan`、`ip`），不要求 `/opt/gitlab`；`require_machine` 以機器角色（`online`／`server`／`ubuntu`）命名 — 固定 IP 通常在安裝 GitLab 之前設定，偏離 PR-COM-04 字面（環境不符時中止並說明應在哪台執行仍成立）。
+- 2026-10-20 `nginx.sh` 三項防呆偏離 04 文件：相依錯誤解析 `dpkg -i` 自身輸出而非 `dpkg -l | grep nginx`（後者漏掉非 nginx 名稱的相依）、來源行寫死 noble 故 codename 必須為 noble、下載前確認 `apt-cache policy nginx` 的候選版本來自 nginx.org（避免打包到 Ubuntu 自家 nginx）。

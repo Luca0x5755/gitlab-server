@@ -13,7 +13,7 @@ blocked-by: [ISSUE-004, ISSUE-009]
 - 驗證：`systemctl status nginx`、`gitlab-ctl status`、`curl -kI https://<IP>`（PR-NGX-08）。
 - 「切換回內建 Nginx」：移除管理區塊、停用並關閉外部 nginx、`reconfigure`（PR-NGX-09）。
 - 範本渲染、worker 使用者偵測等純函式有 bash 測試（PR-COM-10）。
-- 「常見問題排查」補上 502、Permission denied、413、WebSocket、push/pull 失敗等條目。
+- 「常見問題排查」補與設定相關的新條目（502、Permission denied、413、WebSocket、push/pull 失敗已由 ISSUE-009 帶入，不重複）；`docs/04-nginx.md` 第 5 到 10 節的前置條件與注意事項（如 external_url 說明）併入本腳本的「說明」。
 
 ## Context
 規格見 `docs/issues/ISSUE-001-interactive-ops-scripts.md`。來源文件 `docs/04-nginx.md` 第 5 到 10 節與回切章節。原文件 `docs/01-install-and-config.md` 第三部分與 04 互相矛盾（`www-data` 對 `nginx`），本專案以偵測實際 worker 使用者解決，理由見 `docs/decision-log.md`。憑證函式由 ISSUE-004 提供，管理區塊函式由 ISSUE-003 提供，`nginx.sh` 骨架由 ISSUE-009 建立。
