@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # 外部 Nginx 選單腳本（離線套件）：【有網路的電腦】下載含相依的 .deb 並打包、
 # 【GitLab 伺服器】解包安裝並驗證。只有互動選單，不收參數。
-# 來源文件：docs/04-nginx.md 第 1 到 4 節與排查表（說明與排查內容併入本檔）。
-# 反向代理設定、停用內建 Nginx、回切由後續票（ISSUE-010）在本檔追加。
+# 來源文件：docs/04-nginx.md（說明與排查內容併入本檔）；docs/01-install-and-config.md 第三部分
+# 的 gitlab.rb 設定以偵測 nginx.conf 的 user 取代寫死的 www-data（見 docs/decision-log.md）。
+# 停用內建 Nginx、憑證、反向代理設定、驗證與切回內建 Nginx 在本檔後半（選單 4 到 8）。
 #
 # 頂層只定義函式，不執行任何動作；`set -euo pipefail` 與 `cd` 都在 main 內，
 # 所以測試可以 source 本檔取得函式而不啟動選單。
 #
 # 可由環境變數覆寫的路徑（供測試用，預設為正式路徑；它們不是命令列參數）：
-#   NGX_KEYRING、NGX_SOURCES_LIST、OS_RELEASE_FILE、GITLAB_NGINX_BIN、GITLAB_OPT_DIR、TMPDIR。
+#   NGX_KEYRING、NGX_SOURCES_LIST、OS_RELEASE_FILE、GITLAB_NGINX_BIN、GITLAB_OPT_DIR、TMPDIR、
+#   NGINX_CONF（/etc/nginx/nginx.conf）、NGINX_CONF_D（/etc/nginx/conf.d）、NGINX_SSL_DIR（/etc/nginx/ssl）、
+#   WORKHORSE_SOCKET、GITLAB_SSL_DIR、GITLAB_RB。
 
 _ngx_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
@@ -17,6 +20,13 @@ _ngx_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NGX_KEY_URL="https://nginx.org/keys/nginx_signing.key"
 NGX_KEYRING_DEFAULT="/usr/share/keyrings/nginx-archive-keyring.gpg"
 NGX_SOURCES_DEFAULT="/etc/apt/sources.list.d/nginx.list"
+# 外部 Nginx 的管理區塊名稱；與 install.sh 的 install_https 不同名，回切才能精準移除。
+NGX_EXT_BLOCK="nginx_external"
+
+nginx_main_conf() { echo "${NGINX_CONF:-/etc/nginx/nginx.conf}"; }
+ngx_conf_d() { echo "${NGINX_CONF_D:-/etc/nginx/conf.d}"; }
+ngx_ssl_dir() { echo "${NGINX_SSL_DIR:-/etc/nginx/ssl}"; }
+workhorse_socket() { echo "${WORKHORSE_SOCKET:-/var/opt/gitlab/gitlab-workhorse/sockets/socket}"; }
 
 # ── 解析（純函式）───────────────────────────────────────────────────
 
@@ -91,6 +101,153 @@ dpkg_missing_deps() {
         -e 's/^  Version of ([^ ]+) on system is .*$/\1/p' \
         | sed 's/:.*$//' | LC_ALL=C sort -u
 }
+
+# ── 反向代理設定（純函式）────────────────────────────────────────────────────
+
+# 讀 nginx.conf 的 user 指令（只在主層級合法）：取第一個名稱（可有 group 第二個）。
+# 去掉 # 註解；找不到回非 0。官方套件為 nginx，Ubuntu 預設庫為 www-data——以實際設定為準。
+detect_nginx_user() { # detect_nginx_user <nginx.conf>
+    local line re='^[[:space:]]*user[[:space:]]+([A-Za-z_][A-Za-z0-9._-]*)([[:space:]]+[A-Za-z_][A-Za-z0-9._-]*)?[[:space:]]*;'
+    [ -f "$1" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%%#*}"
+        if [[ $line =~ $re ]]; then
+            echo "${BASH_REMATCH[1]}"
+            return 0
+        fi
+    done <"$1"
+    return 1
+}
+
+valid_unix_user() { [[ $1 =~ ^[A-Za-z_][A-Za-z0-9._-]*$ ]]; }
+
+# 停用內建 Nginx 的管理區塊內容。
+render_external_block() { # render_external_block <worker 使用者>
+    valid_unix_user "$1" || return 1
+    echo "nginx['enable'] = false"
+    echo "web_server['external_users'] = ['$1']"
+}
+
+valid_nginx_scheme() { [[ $1 == https || $1 == http ]]; }
+valid_cert_source() { [[ $1 == generate || $1 == copy ]]; }
+
+# 站台設定範本。內容含 nginx 變數（$http_host、$http_upgrade…），所以一律用單引號 heredoc，
+# 渲染時只替換 @@…@@ 佔位符，不經 shell 展開。
+_ngx_tpl_https() {
+    cat <<'TPL'
+upstream gitlab-workhorse {
+    server unix:/var/opt/gitlab/gitlab-workhorse/sockets/socket fail_timeout=0;
+}
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+# HTTP → HTTPS 自動導向
+server {
+    listen 80;
+    server_name @@SERVER_NAME@@;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name @@SERVER_NAME@@;
+
+    ssl_certificate     @@CERT@@;
+    ssl_certificate_key @@KEY@@;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    # 不限制上傳大小 (Git LFS / 大型 repo)
+    client_max_body_size 0;
+    chunked_transfer_encoding on;
+
+    location / {
+        proxy_pass http://gitlab-workhorse;
+
+        proxy_set_header Host              $http_host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Ssl   on;
+
+        proxy_read_timeout    3600;
+        proxy_connect_timeout 300;
+        proxy_redirect        off;
+
+        # WebSocket 支援 (Action Cable / 即時功能)
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+    }
+}
+TPL
+}
+
+_ngx_tpl_http() {
+    cat <<'TPL'
+upstream gitlab-workhorse {
+    server unix:/var/opt/gitlab/gitlab-workhorse/sockets/socket fail_timeout=0;
+}
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 80;
+    server_name @@SERVER_NAME@@;
+
+    client_max_body_size 0;
+    chunked_transfer_encoding on;
+
+    location / {
+        proxy_pass http://gitlab-workhorse;
+
+        proxy_set_header Host              $http_host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_read_timeout    3600;
+        proxy_connect_timeout 300;
+        proxy_redirect        off;
+
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+    }
+}
+TPL
+}
+
+# render_nginx_conf <https|http> <server_name> [憑證路徑 私鑰路徑]：stdout 為整份 gitlab.conf。
+# server_name 與路徑都是白名單值（不會夾帶 nginx 指令或換行）；不合格回非 0 且不輸出。
+render_nginx_conf() {
+    local mode="$1" name="$2" cert="${3:-}" key="${4:-}" t
+    valid_cert_host "$name" || return 1
+    case "$mode" in
+        https)
+            valid_local_path "$cert" && valid_local_path "$key" || return 1
+            t="$(_ngx_tpl_https)"
+            ;;
+        http) t="$(_ngx_tpl_http)" ;;
+        *) return 1 ;;
+    esac
+    t="${t//@@SERVER_NAME@@/$name}"
+    t="${t//@@CERT@@/$cert}"
+    t="${t//@@KEY@@/$key}"
+    printf '%s\n' "$t"
+}
+
+# `ss -Hltn` 輸出（stdin）中監聽 80 或 443 的列（本機位址欄以 :80／:443 結尾）。
+listeners_80_443() { awk '$4 ~ /:(80|443)$/'; }
 
 # ── 離線套件包（打包與解包前的檢查）──────────────────────────────────────────
 
@@ -313,7 +470,192 @@ ngx_install_offline() {
     return "$rc"
 }
 
-# ── 說明與排查（內容取自 docs/04-nginx.md 第 1 到 4 節與排查表）────────────────
+# ── 停用內建、憑證、反向代理、驗證、回切 ─────────────────────────────────────
+
+# 【GitLab 伺服器】偵測外部 Nginx 的 worker 使用者，以管理區塊停用內建 Nginx 並 reconfigure，
+# 確認 Workhorse socket 存在（PR-NGX-03）。
+ngx_disable_builtin() {
+    local user body line rc=0 sock
+    require_machine server
+    ngx_require_cmds nginx
+    require_root
+    user="$(detect_nginx_user "$(nginx_main_conf)")" \
+        || die "讀不到 $(nginx_main_conf) 的 user 指令。請先用選單 3 安裝外部 Nginx。"
+    body="$(render_external_block "$user")" || die "worker 使用者名稱不合法：$user"
+    echo "偵測到外部 Nginx 的 worker 使用者：$user（官方套件為 nginx，Ubuntu 預設庫為 www-data）"
+    echo "將在 $(gitlab_rb_file) 以管理區塊（$NGX_EXT_BLOCK）寫入："
+    while IFS= read -r line; do echo "    $line"; done <<<"$body"
+    echo "（external_url 維持不變，須與使用者實際訪問的網址一致。）"
+    apply_managed_block "$NGX_EXT_BLOCK" "$body" || rc=$?
+    case "$rc" in
+        0) ;;
+        1) echo "✗ reconfigure 失敗，見上方說明。" >&2; return 1 ;;
+        3) echo "✗ 寫入 gitlab.rb 失敗，已自動還原。" >&2; return 3 ;;
+        *) echo "✗ 未寫入任何變更。" >&2; return "$rc" ;;
+    esac
+    sock="$(workhorse_socket)"
+    if [ -S "$sock" ]; then
+        ls -la -- "$sock"
+        echo "✓ 內建 Nginx 已停用；Workhorse socket 存在。下一步：選單 5 準備憑證、選單 6 設定反向代理。"
+    else
+        echo "⚠ 找不到 Workhorse socket（$sock）。請確認 sudo gitlab-ctl status 的 workhorse 在運行；" >&2
+        echo "  沒有它外部 Nginx 會回 502（見「常見問題排查」）。" >&2
+        return 1
+    fi
+}
+
+# 【GitLab 伺服器】憑證：產生自簽（共用 make_self_signed_cert）或複製 /etc/gitlab/ssl 既有的（PR-NGX-04）。
+ngx_prepare_cert() {
+    local host source dir crt key from_crt from_key
+    require_machine server
+    require_root
+    host="$(ask_param NGX_SERVER_NAME "server_name（IP 或網域，須與瀏覽器輸入的一致）" "$(env_get INS_HTTPS_HOST)" valid_cert_host)"
+    source="$(ask_param NGX_CERT_SOURCE "憑證來源（generate＝產生自簽、copy＝複製 $(ssl_dir) 既有憑證）" generate valid_cert_source)"
+    dir="$(ngx_ssl_dir)"
+    crt="$dir/$host.crt"
+    key="$dir/$host.key"
+    if [ -e "$crt" ] || [ -e "$key" ]; then
+        echo "已有憑證：$crt"
+        confirm "要覆蓋舊的憑證與私鑰嗎？" || { echo "已取消，沿用既有憑證。"; return 0; }
+    fi
+    case "$source" in
+        generate)
+            have_cmd openssl || die "缺少指令 openssl，無法產生憑證。"
+            make_self_signed_cert "$host" "$dir"
+            ;;
+        copy)
+            from_crt="$(ssl_dir)/$host.crt"
+            from_key="$(ssl_dir)/$host.key"
+            [ -f "$from_crt" ] && [ -f "$from_key" ] || die "找不到 $from_crt 或 $from_key。請改選 generate，或先到 install.sh 選單 8 產生。"
+            ( umask 077 && mkdir -p "$dir" && cp -- "$from_crt" "$crt" && cp -- "$from_key" "$key" ) || die "複製憑證失敗。"
+            chmod 600 "$key" && chmod 644 "$crt" || die "設定憑證權限失敗。"
+            echo "  已複製：$from_crt → $crt"
+            echo "  已複製：$from_key → $key"
+            ;;
+    esac
+    echo "✓ 憑證就緒。下一步：選單 6 設定反向代理。"
+}
+
+# 80／443 是否可以交給外部 Nginx：外部 nginx 正在跑時它自己佔著，重啟會釋放，放行；
+# 否則任何監聽者（尤其是尚未停用的內建 Nginx）都是衝突。
+ngx_ports_ready() {
+    local busy
+    if systemctl is-active --quiet nginx; then
+        return 0
+    fi
+    have_cmd ss || die "缺少指令 ss，無法確認 80／443 已釋放，不啟動 nginx。"
+    busy="$(ss -Hltnp | listeners_80_443)" || true
+    if [ -n "$busy" ]; then
+        echo "✗ 80 或 443 仍被佔用，不啟動 nginx：" >&2
+        printf '%s\n' "$busy" | sed 's/^/  /' >&2
+        echo "  內建 Nginx 尚未停用的話，請先執行選單 4；其他程式請先停掉。" >&2
+        return 1
+    fi
+}
+
+# 【GitLab 伺服器】產生 conf.d/gitlab.conf 並啟用（PR-NGX-05、06、07）。
+ngx_configure_proxy() {
+    local host scheme dir conf bak="" crt key ts body
+    require_machine server
+    ngx_require_cmds nginx systemctl
+    require_root
+    block_present "$(gitlab_rb_file)" "$NGX_EXT_BLOCK" \
+        || die "尚未停用內建 Nginx（gitlab.rb 沒有 $NGX_EXT_BLOCK 區塊）。請先執行選單 4。"
+    host="$(ask_param NGX_SERVER_NAME "server_name（IP 或網域）" "$(env_get INS_HTTPS_HOST)" valid_cert_host)"
+    scheme="$(ask_param NGX_SCHEME "對外協定（https／http）" https valid_nginx_scheme)"
+    dir="$(ngx_conf_d)"
+    conf="$dir/gitlab.conf"
+    crt="$(ngx_ssl_dir)/$host.crt"
+    key="$(ngx_ssl_dir)/$host.key"
+    if [ "$scheme" = https ]; then
+        [ -f "$crt" ] && [ -f "$key" ] || die "找不到憑證 $crt 或 $key。請先執行選單 5 準備憑證。"
+        body="$(render_nginx_conf https "$host" "$crt" "$key")" || die "設定值不合法，未寫入。"
+    else
+        echo "⚠ HTTP 模式沒有加密，僅供測試或內網無加密需求。"
+        body="$(render_nginx_conf http "$host")" || die "設定值不合法，未寫入。"
+    fi
+    ngx_ports_ready || return 1
+
+    mkdir -p "$dir" || die "無法建立 $dir。"
+    if [ -f "$conf" ]; then
+        ts="$(now_stamp)"
+        bak="$conf.bak-$ts"
+        cp -p -- "$conf" "$bak" || die "備份 $conf 失敗，未修改。"
+        echo "  已備份舊設定：$bak"
+    fi
+    printf '%s\n' "$body" >"$conf" || { [ -z "$bak" ] || cp -- "$bak" "$conf"; die "寫入 $conf 失敗。"; }
+    echo "將使用的設定：$conf（server_name $host，$scheme）"
+    if ! nginx -t; then
+        if [ -n "$bak" ]; then cp -- "$bak" "$conf"; else rm -f "$conf"; fi
+        echo "✗ nginx -t 失敗，已還原舊設定，未重啟 nginx。" >&2
+        return 1
+    fi
+    # 預設站台改名而不是刪除：nginx 只載入 *.conf，效果等同移除，且可復原。
+    if [ -f "$dir/default.conf" ]; then
+        mv -- "$dir/default.conf" "$dir/default.conf.bak-$(now_stamp)" || die "無法移除預設站台 $dir/default.conf。"
+        echo "  已移除預設站台（改名為 default.conf.bak-…）。"
+    fi
+    systemctl restart nginx || die "systemctl restart nginx 失敗。請看 sudo journalctl -u nginx 與「常見問題排查」。"
+    systemctl enable nginx || echo "⚠ systemctl enable nginx 失敗，開機後可能不會自動啟動。" >&2
+    if have_cmd ufw; then
+        ufw allow 80/tcp || echo "⚠ ufw allow 80/tcp 失敗，請手動放行。" >&2
+        ufw allow 443/tcp || echo "⚠ ufw allow 443/tcp 失敗，請手動放行。" >&2
+    else
+        echo "⚠ 找不到 ufw，請自行確認防火牆已放行 80／443。" >&2
+    fi
+    echo "✓ 外部 Nginx 已啟用。請用選單 7 驗證。"
+}
+
+# 【GitLab 伺服器】驗證（PR-NGX-08）：三項各自回報，任一失敗整體回非 0。
+ngx_verify() {
+    local host scheme fails=0
+    require_machine server
+    ngx_require_cmds systemctl curl
+    host="$(env_get NGX_SERVER_NAME)"
+    scheme="$(env_get NGX_SCHEME)"
+    [ -n "$host" ] || die "還沒有設定 server_name。請先執行選單 6。"
+    valid_nginx_scheme "$scheme" || scheme=https
+    echo "── systemctl status nginx ──"
+    systemctl status nginx --no-pager || { echo "✗ nginx 未在運行。" >&2; fails=$((fails + 1)); }
+    echo "── gitlab-ctl status ──"
+    if have_cmd gitlab-ctl; then
+        gitlab-ctl status || { echo "✗ GitLab 有服務未運行。" >&2; fails=$((fails + 1)); }
+    else
+        echo "✗ 找不到 gitlab-ctl。" >&2
+        fails=$((fails + 1))
+    fi
+    echo "── curl -kI $scheme://$host ──"
+    curl -kI -sS -m 10 "$scheme://$host" || { echo "✗ 連不上 $scheme://$host。" >&2; fails=$((fails + 1)); }
+    [ "$fails" -eq 0 ] || return 1
+    echo "✓ 驗證通過。瀏覽器訪問 $scheme://$host 應可看到 GitLab 登入頁。"
+}
+
+# 【GitLab 伺服器】切回內建 Nginx（PR-NGX-09）：先停外部 nginx 釋放 80／443，再移除管理區塊並 reconfigure。
+ngx_revert_builtin() {
+    local rc=0
+    require_machine server
+    ngx_require_cmds systemctl
+    require_root
+    if ! block_present "$(gitlab_rb_file)" "$NGX_EXT_BLOCK"; then
+        echo "gitlab.rb 沒有本腳本的外部 Nginx 區塊（$NGX_EXT_BLOCK），不需切換。"
+        echo "（若是手動寫了 nginx['enable'] = false，請自行編輯 gitlab.rb 後 reconfigure。）"
+        return 0
+    fi
+    echo "將停用並關閉外部 nginx，移除管理區塊 $NGX_EXT_BLOCK，並 reconfigure 啟用內建 Nginx。"
+    confirm "確定切回內建 Nginx？服務會短暫中斷。" || { echo "已取消，未做任何變更。"; return 0; }
+    systemctl stop nginx || echo "⚠ systemctl stop nginx 失敗（可能本來就沒在跑）。" >&2
+    systemctl disable nginx || echo "⚠ systemctl disable nginx 失敗。" >&2
+    remove_managed_block "$NGX_EXT_BLOCK" || rc=$?
+    case "$rc" in
+        0) echo "✓ 已切回內建 Nginx。$(ngx_conf_d)/gitlab.conf 留在原處但不再被載入。" ;;
+        1) echo "✗ reconfigure 失敗，見上方說明。" >&2 ;;
+        3) echo "✗ 寫入 gitlab.rb 失敗，已自動還原。" >&2 ;;
+        *) echo "✗ 未寫入任何變更。" >&2 ;;
+    esac
+    return "$rc"
+}
+
+# ── 說明與排查（內容取自 docs/04-nginx.md 與排查表）────────────────
 
 show_help() {
     cat <<'TXT'
@@ -341,7 +683,23 @@ show_help() {
     會一併升級系統套件。安裝前腳本會列出清單並要求輸入 yes。
   - 若出現相依性錯誤，腳本會列出有問題的套件與缺少的相依；請回【有網路的電腦】
     以 apt-get download 補下載後再傳來，必要時執行 sudo dpkg --configure -a。
-  - 停用內建 Nginx、反向代理設定與切回內建 Nginx 的步驟不在這四步內，由後續功能提供。
+
+後續步驟（選單 4 到 8，皆在【GitLab 伺服器】）：
+  4. 停用內建 Nginx：讀 /etc/nginx/nginx.conf 的 user 指令填入 web_server['external_users']
+     （官方套件為 nginx，Ubuntu 預設庫為 www-data，以實際設定為準），nginx['enable'] = false，
+     以管理區塊（nginx_external）寫入並 reconfigure，最後確認 Workhorse socket 存在。
+     external_url 維持不變，可以是 IP 或網域（例 'https://192.168.9.129'），只要與使用者實際
+     訪問的網址一致；它決定 GitLab 產生的連結（clone URL、通知信等）。使用網域時，
+     server_name 與憑證也須對應該網域。
+  5. 憑證：產生自簽憑證（效期 10 年、含 subjectAltName），或複製 /etc/gitlab/ssl 已有的憑證；
+     放在 /etc/nginx/ssl/<IP或網域>.crt／.key。
+  6. 反向代理：產生 /etc/nginx/conf.d/gitlab.conf（HTTPS 為推薦；HTTP 僅供測試或內網無加密需求）。
+     先 nginx -t，失敗就還原舊設定且不重啟；確認 80／443 已釋放才 systemctl restart nginx，
+     並移除預設站台、enable nginx、ufw allow 80/tcp 與 443/tcp。
+  7. 驗證：systemctl status nginx、gitlab-ctl status、curl -kI。
+  8. 切換回內建 Nginx：停用並關閉外部 nginx，移除管理區塊，reconfigure。
+  - 若曾用 install.sh 啟用內建 Nginx 的 HTTPS（install_https 區塊），external_url 會是 https，
+    改用外部 Nginx 後其 nginx['redirect_http_to_https'] 不再生效，導向由 gitlab.conf 負責。
 TXT
 }
 
@@ -375,6 +733,17 @@ show_troubleshooting() {
       （GitLab 內建 Nginx 尚未停用時會佔住 80／443）。
     網頁可開但 Git push/pull 失敗：proxy_read_timeout 過短。
       確認 proxy_read_timeout 3600; 已設定，大型 repo 操作需要較長的 timeout。
+  選單 4 到 8 的訊息：
+    選單 4 讀不到 user：尚未安裝外部 Nginx（先選 3），或 nginx.conf 沒有 user 指令。
+    選單 4 找不到 Workhorse socket：GitLab 服務沒起來；sudo gitlab-ctl status、sudo gitlab-ctl restart。
+    選單 6 說 80／443 仍被佔用：多半是內建 Nginx 尚未停用（先選 4）；
+      sudo ss -tlnp | grep -E ':80|:443' 看是誰。
+    選單 6 說 nginx -t 失敗：腳本已還原舊設定且沒有重啟；修正 nginx 輸出的錯誤後重跑。
+    選單 6 找不到憑證：先選 5；憑證檔名須是 <server_name>.crt／.key，放在 /etc/nginx/ssl。
+    驗證 curl 失敗：-k 已略過自簽憑證檢查；仍連不上請看 sudo nginx -t、sudo ufw status、
+      sudo gitlab-ctl status。
+    切回內建後網頁打不開：sudo gitlab-ctl status 看 nginx 是否 run；80／443 是否被外部 nginx
+      殘留佔用（sudo systemctl status nginx 應為 inactive）。
 TXT
 }
 
@@ -386,8 +755,13 @@ show_menu() {
   1) 顯示 GitLab 內建 Nginx 版本   【GitLab 伺服器】
   2) 準備離線套件並打包            【有網路的電腦】
   3) 解包並安裝 Nginx              【GitLab 伺服器】
-  4) 說明                          【有網路的電腦】【GitLab 伺服器】
-  5) 常見問題排查                  【有網路的電腦】【GitLab 伺服器】
+  4) 停用內建 Nginx（external_users）  【GitLab 伺服器】
+  5) 準備憑證（產生或複製）        【GitLab 伺服器】
+  6) 設定反向代理並啟用            【GitLab 伺服器】
+  7) 驗證                          【GitLab 伺服器】
+  8) 切換回內建 Nginx              【GitLab 伺服器】
+  9) 說明                          【有網路的電腦】【GitLab 伺服器】
+  10) 常見問題排查                 【有網路的電腦】【GitLab 伺服器】
   q) 離開
 TXT
 }
@@ -397,8 +771,13 @@ dispatch() {
         1) ngx_show_builtin ;;
         2) ngx_build_offline ;;
         3) ngx_install_offline ;;
-        4) show_help ;;
-        5) show_troubleshooting ;;
+        4) ngx_disable_builtin ;;
+        5) ngx_prepare_cert ;;
+        6) ngx_configure_proxy ;;
+        7) ngx_verify ;;
+        8) ngx_revert_builtin ;;
+        9) show_help ;;
+        10) show_troubleshooting ;;
         *) echo "✗ 無此選項：$1" >&2 ;;
     esac
 }

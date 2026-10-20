@@ -583,17 +583,17 @@ assert_status 2 "多個參數也拒絕" env PATH="$SB/bin:$PATH" bash "$ngx" -h 
 assert_status 0 "q 離開結束碼 0" bash -c "printf 'q\n' | env PATH='$SB/bin:$PATH' bash '$ngx'"
 assert_status 0 "stdin EOF 離開結束碼 0" bash -c "env PATH='$SB/bin:$PATH' bash '$ngx' </dev/null"
 menu="$(run_ngx 'q\n')"
-for n in 1 2 3 4 5; do
+for n in 1 2 3 4 5 6 7 8 9 10; do
     line="$(printf '%s\n' "$menu" | grep "^  $n)")"
     assert_contains "$line" "【" "選單第 $n 項標示執行機器（PR-COM-04）"
 done
 assert_contains "$(printf '%s\n' "$menu" | grep '^  1)')" "【GitLab 伺服器】" "顯示內建版本：【GitLab 伺服器】"
 assert_contains "$(printf '%s\n' "$menu" | grep '^  2)')" "【有網路的電腦】" "打包：【有網路的電腦】"
 assert_contains "$(printf '%s\n' "$menu" | grep '^  3)')" "【GitLab 伺服器】" "安裝：【GitLab 伺服器】"
-assert_contains "$(printf '%s\n' "$menu" | grep '^  4)')" "說明" "第 4 項是說明"
-assert_contains "$(printf '%s\n' "$menu" | grep '^  4)')" "【有網路的電腦】【GitLab 伺服器】" "說明：沿用兩個既有標示"
-assert_contains "$(printf '%s\n' "$menu" | grep '^  5)')" "常見問題排查" "第 5 項是常見問題排查"
-assert_contains "$(printf '%s\n' "$menu" | grep '^  5)')" "【有網路的電腦】【GitLab 伺服器】" "排查：沿用兩個既有標示"
+assert_contains "$(printf '%s\n' "$menu" | grep '^  9)')" "說明" "第 9 項是說明"
+assert_contains "$(printf '%s\n' "$menu" | grep '^  9)')" "【有網路的電腦】【GitLab 伺服器】" "說明：沿用兩個既有標示"
+assert_contains "$(printf '%s\n' "$menu" | grep '^  10)')" "常見問題排查" "第 10 項是常見問題排查"
+assert_contains "$(printf '%s\n' "$menu" | grep '^  10)')" "【有網路的電腦】【GitLab 伺服器】" "排查：沿用兩個既有標示"
 assert_not_contains "$menu" "任一台" "不新增第三種標示"
 
 # 動作失敗：行程仍回選單、stderr 顯示「動作未完成」；成功則沒有（正向對照）
@@ -612,11 +612,11 @@ assert_eq "yes" "$(yn test -f "$SB/out/menu.tar.gz")" "選單 2 打包成功：�
 out="$(run_ngx "2\n$SB/out/menu2.tar.gz\nq\n" OPS_FAKE_UID=1000)"
 assert_contains "$out" "動作未完成（結束碼 1）" "選單 2 非 root：動作未完成"
 assert_contains "$out" "已離開" "動作失敗後仍回選單，可正常離開"
-out="$(run_ngx '9\nq\n')"
+out="$(run_ngx '99\nq\n')"
 assert_contains "$out" "無此選項" "無效選項有提示"
 
 # 說明（PR-COM-11）：前置條件與注意事項，只斷言來源文件的標記字串
-help="$(run_ngx '4\nq\n')"
+help="$(run_ngx '9\nq\n')"
 assert_contains "$help" "前置條件" "說明含前置條件"
 assert_contains "$help" "sudo gitlab-ctl reconfigure" "說明：前置條件需至少 reconfigure 一次"
 assert_contains "$help" "Ubuntu 24.04" "說明：須在相同 Ubuntu 24.04 的電腦打包"
@@ -629,7 +629,7 @@ assert_contains "$help" "升級" "說明：提醒 dpkg -i 可能升級系統套�
 assert_not_contains "$help" "動作未完成" "說明項目本身成功"
 
 # 常見問題排查（PR-COM-11）：04 文件排查表六列整份帶入 + 本票新增條目
-fix="$(run_ngx '5\nq\n')"
+fix="$(run_ngx '10\nq\n')"
 assert_contains "$fix" "502 Bad Gateway" "排查：502"
 assert_contains "$fix" "sudo gitlab-ctl status" "排查 502：gitlab-ctl status"
 assert_contains "$fix" "ls -la /var/opt/gitlab/gitlab-workhorse/sockets/socket" "排查 502：確認 socket 存在"
