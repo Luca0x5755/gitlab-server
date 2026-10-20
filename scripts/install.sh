@@ -21,8 +21,7 @@ INS_LDAP_BLOCK="install_ldap"
 
 # ── 驗證與解析（純函式）──────────────────────────────────────────────────────
 
-# 版本字串會進 `apt download gitlab-ce=<版本>`，所以只收嚴格格式（擋注入）。
-valid_gitlab_version() { [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+-ce\.[0-9]+$ ]]; }
+# valid_gitlab_version 在 lib/common.sh（upgrade.sh 也用）。
 
 # 解析 `apt-cache madison gitlab-ce` 的輸出：每行一個版本，保留輸入順序、去重（保留首次出現）。
 # 只收套件名為 gitlab-ce 且版本合法的行；其餘（gitlab-ee、空行、雜訊）略過。
@@ -51,14 +50,7 @@ deb_filename() {
     echo "gitlab-ce_$1_${arch}.deb"
 }
 
-# deb_version <檔名或路徑>：從 gitlab-ce_<版本>_<架構>.deb 取出版本；不是這種檔名回非 0。
-deb_version() {
-    local base="${1##*/}" re='^gitlab-ce_([^_]+)_[a-z0-9]+[.]deb$' ver
-    [[ $base =~ $re ]] || return 1
-    ver="${BASH_REMATCH[1]}"
-    valid_gitlab_version "$ver" || return 1
-    echo "$ver"
-}
+# deb_version 在 lib/common.sh（upgrade.sh 也用）。
 
 # /etc/os-release 的 VERSION_CODENAME（去引號）；檔案不存在或沒有該行回空。
 os_codename() {

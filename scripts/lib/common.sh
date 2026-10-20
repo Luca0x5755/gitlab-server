@@ -454,3 +454,18 @@ make_self_signed_cert() {
 data_backup_dir() { echo "${GITLAB_BACKUP_DIR:-/var/opt/gitlab/backups}"; }
 config_backup_dir() { echo "${GITLAB_CONFIG_BACKUP_DIR:-/etc/gitlab/config_backup}"; }
 backup_log_file() { echo "${BACKUP_AUTO_LOG:-/var/log/gitlab_backup.log}"; }
+
+# ── GitLab .deb 檔名（install.sh、upgrade.sh 共用）─────────────────────────────
+
+# 版本字串會進 `apt download gitlab-ce=<版本>`，所以只收嚴格格式（擋注入）。
+valid_gitlab_version() { [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+-ce\.[0-9]+$ ]]; }
+
+# deb_version <檔名或路徑>：從 gitlab-ce_<版本>_<架構>.deb 取出版本；不是這種檔名回非 0。
+deb_version() {
+    local base="${1##*/}" re='^gitlab-ce_([^_]+)_[a-z0-9]+[.]deb$' ver
+    [[ $base =~ $re ]] || return 1
+    ver="${BASH_REMATCH[1]}"
+    valid_gitlab_version "$ver" || return 1
+    echo "$ver"
+}
+
