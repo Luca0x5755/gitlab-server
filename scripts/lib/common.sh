@@ -85,6 +85,10 @@ valid_ipv4() {
     done
 }
 
+# 本機路徑必須是絕對路徑：含 : 會被 scp 當成遠端主機，./ 與 - 開頭則可能被當成選項。
+# 值也會進 cron 行與指令參數，所以只收白名單字元。
+valid_local_path() { [[ $1 =~ ^/[A-Za-z0-9._/-]*$ ]]; }
+
 # 憑證用的主機：IPv4 或網域（英數開頭結尾，中間可有 . -）。值會進檔名與 openssl 參數，
 # 所以只收白名單；全數字加點的必須是合法 IPv4（避免 999.1.1.1 被當成網域）。
 valid_cert_host() {
@@ -444,3 +448,9 @@ make_self_signed_cert() {
     echo "  已產生憑證：$crt"
     echo "  已產生私鑰：$key"
 }
+
+# ── 備份路徑（backup.sh、backup_auto.sh 共用；環境變數供測試覆寫）─────────────────
+
+data_backup_dir() { echo "${GITLAB_BACKUP_DIR:-/var/opt/gitlab/backups}"; }
+config_backup_dir() { echo "${GITLAB_CONFIG_BACKUP_DIR:-/etc/gitlab/config_backup}"; }
+backup_log_file() { echo "${BACKUP_AUTO_LOG:-/var/log/gitlab_backup.log}"; }

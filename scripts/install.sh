@@ -99,8 +99,7 @@ _valid_host() {
 valid_scp_user() { [[ $1 =~ ^[A-Za-z_][A-Za-z0-9._-]*$ ]]; }
 valid_scp_host() { _valid_host "$1"; }
 valid_remote_dir() { [[ $1 =~ ^[A-Za-z0-9._/~][A-Za-z0-9._/~-]*$ ]]; }
-# 本機路徑必須是絕對路徑：含 : 會被 scp 當成遠端主機，./ 與 - 開頭則可能被當成選項。
-valid_local_path() { [[ $1 =~ ^/[A-Za-z0-9._/-]*$ ]]; }
+# valid_local_path 在 lib/common.sh（backup.sh 等也用）。
 valid_download_dir() { valid_local_path "$1"; }
 
 # external_url：http(s)://主機[:port]，不含路徑、帳號、引號、空白（值會放進 Ruby 單引號字串）。

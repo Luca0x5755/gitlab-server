@@ -36,7 +36,8 @@ gitlab-server/
 
 | 腳本 | 說明 |
 | --- | --- |
-| [gitlab_backup.sh](scripts/gitlab_backup.sh) | GitLab 自動備份腳本 |
+| [backup_auto.sh](scripts/backup_auto.sh) | GitLab 自動備份（資料備份＋設定備份，供 cron、升級前、選單共用） |
+| [backup.sh](scripts/backup.sh) | 備份選單（立即備份、列出、保留期限、crontab、複製設定備份） |
 
 ## ⚠️ 注意事項
 
