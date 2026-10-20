@@ -19,3 +19,4 @@ ISSUE-003
 ## Notes
 - 憑證檔名沿用 `<IP或網域>.crt`／`.key`，放 `/etc/gitlab/ssl/`。
 - `nginx['redirect_http_to_https']` 只在內建 Nginx 模式使用，勿與 `nginx.sh` 的外部 Nginx 設定混在同一個區塊。
+- 重跑 `install.sh` 的「設定 external_url」項目（ISSUE-003）會把 external_url 改回 http，而本票的 redirect 區塊仍在；兩者不一致的處理是本票的責任，ISSUE-003 不處理。
