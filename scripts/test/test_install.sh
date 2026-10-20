@@ -82,9 +82,11 @@ for u in luca deploy_1 a.b-c _svc; do assert_status 0 "合法 user：$u" valid_s
 for u in "" -oProxy 1abc "a b" 'a;b' 'a$b' "a'b" 'a@b' 'a:b'; do assert_nonzero "非法 user：[$u]" valid_scp_user "$u"; done
 for h in 192.168.9.129 gitlab-srv gitlab.example.com a1; do assert_status 0 "合法 host：$h" valid_scp_host "$h"; done
 for h in "" -oProxyCommand=x 300.1.1.1 1.2.3 "a b" 'a;b' 'a$b' "a'b" .example.com example.com. 'a:b' 'a/b'; do assert_nonzero "非法 host：[$h]" valid_scp_host "$h"; done
+# shellcheck disable=SC2088  # '~/' 是刻意的字面值：遠端目錄交給 scp 在遠端展開
 for d in '~/' '~' /home/luca /srv/gl-debs ./x a/b.c; do assert_status 0 "合法遠端目錄：$d" valid_remote_dir "$d"; done
 for d in "" -r "-oX=y" 'a b' 'a;b' 'a$b' 'a:b' "a'b" 'a"b'; do assert_nonzero "非法遠端目錄：[$d]" valid_remote_dir "$d"; done
 for p in /home/luca/dl /tmp/gitlab-ce_18.7.6-ce.0_amd64.deb /; do assert_status 0 "合法本機路徑：$p" valid_local_path "$p"; done
+# shellcheck disable=SC2088  # '~/dl' 是刻意的字面值：本機路徑不得以 ~ 開頭
 for p in "" dl ./dl ../dl -oX /tmp/a:b host:/tmp/x "/tmp/a b" '/tmp/a;b' '/tmp/$x' "/tmp/a'b" '~/dl'; do assert_nonzero "非法本機路徑：[$p]" valid_local_path "$p"; done
 assert_status 0 "下載目錄：絕對路徑合法" valid_download_dir /home/luca/gitlab-debs
 assert_nonzero "下載目錄：相對路徑拒絕" valid_download_dir gitlab-debs

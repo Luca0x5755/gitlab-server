@@ -226,12 +226,12 @@ add_repo() {
 }
 
 list_versions() {
-    local vers
+    local vers line
     ins_require_online apt-cache
     vers="$(apt-cache madison gitlab-ce | parse_madison | sort_versions desc)" || true
     [ -n "$vers" ] || die "找不到 gitlab-ce 的可用版本。請先執行選單 1 加入套件來源。"
     echo "可用的 gitlab-ce 版本（新到舊）："
-    sed 's/^/  /' <<<"$vers"
+    while IFS= read -r line; do echo "  $line"; done <<<"$vers"
 }
 
 download_deb() {
@@ -256,6 +256,7 @@ send_deb() {
     deb_version "$deb" >/dev/null || die "檔名不是 gitlab-ce_<版本>_<架構>.deb：$deb"
     user="$(ask_param INS_SERVER_USER "伺服器登入帳號" "${USER:-}" valid_scp_user)"
     host="$(ask_param INS_SERVER_HOST "伺服器 IP 或主機名" "" valid_scp_host)"
+    # shellcheck disable=SC2088  # "~/" 是刻意的字面預設值：交給 scp 在遠端展開，不是本機的 $HOME。
     rdir="$(ask_param INS_REMOTE_DIR "伺服器上的目錄" "~/" valid_remote_dir)"
     echo "傳送：$deb → $user@$host:$rdir"
     scp -- "$deb" "$user@$host:$rdir"
@@ -280,13 +281,13 @@ install_deb() {
 }
 
 set_external_url() {
-    local url body rc=0
+    local url body line rc=0
     ins_require_gitlab_host
     require_root
     url="$(ask_param INS_EXTERNAL_URL "external_url（例 http://192.168.9.129）" "" valid_external_url)"
     body="$(render_external_url "$url")"
     echo "將在 $(gitlab_rb_file) 以管理區塊寫入："
-    sed 's/^/    /' <<<"$body"
+    while IFS= read -r line; do echo "    $line"; done <<<"$body"
     echo "（gitlab.rb 內原本的 external_url 行不動；Ruby 以後出現者為準，管理區塊在檔尾。）"
     apply_managed_block "$INS_URL_BLOCK" "$body" || rc=$?
     case "$rc" in

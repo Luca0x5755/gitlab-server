@@ -6,6 +6,12 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 common="$here/../lib/common.sh"
 . "$common"
 
+# cp 的包裝：CP_FAIL 非空時模擬複製失敗（備份失敗情境用）。定義在所有使用處之前。
+cp() {
+    if [ -n "${CP_FAIL:-}" ]; then return 1; fi
+    command cp "$@"
+}
+
 # ── version_cmp（歸屬本票，ISSUE-007／008 直接使用）──
 vc() { version_cmp "$1" "$2"; }
 assert_eq "-1" "$(vc 18.7.6-ce.0 18.10.0-ce.0)" "18.7 小於 18.10（數值比較，不是字串）"
@@ -172,11 +178,10 @@ fake_reconfigure() {
 }
 
 # 每個情境開頭呼叫：重置 gitlab.rb、清掉備份／快照／記錄，並裝回測試用的覆寫函式。
-reset_rb() { # reset_rb [初始內容檔]
-    unset -f cp
+reset_rb() {
     . "$common"   # 還原 write_file_from／restore_gitlab_rb 等預設實作
     rm -f "$GITLAB_RB".bak-* "$SNAP" "$CALLS" "$STUB_LOG" "$OUT"
-    cp "${1:-$T_TMP/default.rb}" "$GITLAB_RB"
+    cp "$T_TMP/default.rb" "$GITLAB_RB"
     cp "$GITLAB_RB" "$T_TMP/pristine"
     : >"$CALLS"
     RECONF_RC=0
@@ -261,9 +266,7 @@ assert_file_eq "$T_TMP/pristine" "$GITLAB_RB" "標記行帶 CRLF：gitlab.rb 不
 
 # ── 備份失敗：回 2，gitlab.rb 不動 ──
 reset_rb
-cp() { return 1; }
-run_here "$T_TMP/in_eof" apply_managed_block foo "x"
-unset -f cp
+CP_FAIL=1 run_here "$T_TMP/in_eof" apply_managed_block foo "x"
 assert_eq "2" "$rc" "備份失敗：回 2"
 assert_file_eq "$T_TMP/pristine" "$GITLAB_RB" "備份失敗：gitlab.rb 不變"
 assert_eq "0" "$(reconf_calls)" "備份失敗：未 reconfigure"

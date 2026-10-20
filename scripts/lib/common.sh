@@ -327,7 +327,11 @@ backup_gitlab_rb() {
         n=$((n + 1))
         dest="$f.bak-$ts-$n"
     done
-    (umask 077 && cp "$f" "$dest") && chmod 600 "$dest" || { rm -f "$dest"; echo "✗ 備份 $f 失敗。" >&2; return 1; }
+    if ! (umask 077 && cp "$f" "$dest") || ! chmod 600 "$dest"; then
+        rm -f "$dest"
+        echo "✗ 備份 $f 失敗。" >&2
+        return 1
+    fi
     LAST_GITLAB_RB_BAK="$dest"
     echo "  已備份：$dest"
 }
