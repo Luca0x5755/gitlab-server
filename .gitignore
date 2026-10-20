@@ -16,3 +16,6 @@ Thumbs.db
 .idea/
 *.swp
 *~
+
+# 腳本參數檔（維運腳本維護；不存密碼）
+scripts/gitlab-ops.env
