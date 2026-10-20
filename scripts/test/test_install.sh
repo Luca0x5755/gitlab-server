@@ -189,11 +189,11 @@ done <<<"$menu"
 assert_eq "0" "$bad" "每個動作項目都標示機器"
 assert_contains "$menu" "【有網路的電腦】" "選單有【有網路的電腦】項目"
 assert_contains "$menu" "【GitLab 伺服器】" "選單有【GitLab 伺服器】項目"
-help="$(run_ins '10\nq\n')"
+help="$(run_ins '11\nq\n')"
 for k in "Ubuntu 24.04" Noble "apt download" scp "24 小時" initial_root_password reconfigure dpkg; do
     assert_contains "$help" "$k" "說明含：$k"
 done
-fix="$(run_ins '11\nq\n')"
+fix="$(run_ins '12\nq\n')"
 for k in 相依 備份 initial_root_password reconfigure noble; do
     assert_contains "$fix" "$k" "排查含：$k"
 done
@@ -524,7 +524,175 @@ assert_file_eq "$SB/with_https" "$SB/gitlab.rb" "停用遇 EOF（未確認）：
 # 選單與說明
 menu="$(run_ins 'q\n')"
 assert_contains "$menu" "HTTPS" "選單含 HTTPS 項目"
-help="$(run_ins '10\nq\n')"
+help="$(run_ins '11\nq\n')"
 for k in HTTPS subjectAltName 443 ; do assert_contains "$help" "$k" "說明含：$k"; done
-fix="$(run_ins '11\nq\n')"
+fix="$(run_ins '12\nq\n')"
 for k in 443 自簽 /etc/gitlab/ssl; do assert_contains "$fix" "$k" "排查含：$k"; done
+
+# ══ ISSUE-005 LDAP（PR-INS-07）══
+
+# ── 純函式 ──
+assert_eq "389" "$(ldap_default_port plain)" "plain 預設 389"
+assert_eq "389" "$(ldap_default_port start_tls)" "start_tls 預設 389"
+assert_eq "636" "$(ldap_default_port simple_tls)" "simple_tls 預設 636"
+assert_nonzero "未知模式沒有預設 port" ldap_default_port ssl
+for m in plain start_tls simple_tls; do assert_status 0 "合法模式：$m" valid_ldap_mode "$m"; done
+for m in "" ssl tls PLAIN "plain " "start-tls"; do assert_nonzero "非法模式：[$m]" valid_ldap_mode "$m"; done
+for p in 1 389 636 65535; do assert_status 0 "合法 port：$p" valid_port "$p"; done
+for p in "" 0 65536 -1 abc 0389 "38 9" 99999; do assert_nonzero "非法 port：[$p]" valid_port "$p"; done
+assert_status 0 "LDAP 文字：一般 DN" valid_ldap_text "CN=gitlab_svc,OU=Service Accounts,DC=example,DC=com"
+assert_nonzero "LDAP 文字：空" valid_ldap_text ""
+assert_nonzero "LDAP 文字：含換行" valid_ldap_text $'a\nb'
+assert_nonzero "LDAP 文字：含 Tab" valid_ldap_text $'a\tb'
+assert_eq "plain" "$(ruby_sq plain)" "ruby_sq：無特殊字元不變"
+assert_eq "it\\'s" "$(ruby_sq "it's")" "ruby_sq：單引號加反斜線"
+assert_eq "a\\\\b" "$(ruby_sq 'a\b')" "ruby_sq：反斜線加倍"
+assert_eq "a\\\\\\'b" "$(ruby_sq "a\\'b")" "ruby_sq：反斜線＋單引號"
+
+blk="$(render_ldap_block 192.168.9.10 389 'CN=gitlab_svc,OU=Service Accounts,DC=example,DC=com' 'secret' 'OU=Users,DC=example,DC=com' plain)"
+assert_contains "$blk" "gitlab_rails['ldap_enabled'] = true" "區塊啟用 LDAP"
+assert_contains "$blk" "'host'                          => '192.168.9.10'," "區塊 host"
+assert_contains "$blk" "'port'                          => 389," "區塊 port 是數字"
+assert_contains "$blk" "'bind_dn'                       => 'CN=gitlab_svc,OU=Service Accounts,DC=example,DC=com'," "區塊 bind_dn"
+assert_contains "$blk" "'password'                      => 'secret'," "區塊 password"
+assert_contains "$blk" "'encryption'                    => 'plain'," "區塊 encryption"
+assert_contains "$blk" "'base'                          => 'OU=Users,DC=example,DC=com'," "區塊 base"
+assert_contains "$blk" "'uid'                           => 'sAMAccountName'," "區塊 uid"
+assert_contains "$blk" "'active_directory'              => true," "區塊 active_directory"
+blk="$(render_ldap_block ad.example.com 636 'cn=x' 'p' 'dc=x' simple_tls)"
+assert_contains "$blk" "'port'                          => 636," "simple_tls 區塊 port 636"
+assert_contains "$blk" "'encryption'                    => 'simple_tls'," "區塊 simple_tls"
+blk="$(render_ldap_block 1.2.3.4 389 "cn=a'b" 'p\w"d' 'dc=x' start_tls)"
+assert_contains "$blk" "'bind_dn'                       => 'cn=a\\'b'," "bind_dn 的單引號被跳脫"
+assert_contains "$blk" "'password'                      => 'p\\\\w\"d'," "密碼的反斜線被跳脫"
+for args in "bad;host|389|dn|pw|base|plain" "1.2.3.4|0|dn|pw|base|plain" "1.2.3.4|389|dn|pw|base|ssl" "1.2.3.4|389||pw|base|plain" "1.2.3.4|389|dn||base|plain" "1.2.3.4|389|dn|pw||plain"; do
+    IFS='|' read -r a1 a2 a3 a4 a5 a6 <<<"$args"
+    assert_nonzero "區塊拒絕：$args" render_ldap_block "$a1" "$a2" "$a3" "$a4" "$a5" "$a6"
+done
+assert_nonzero "區塊拒絕：密碼含換行" render_ldap_block 1.2.3.4 389 dn $'pw\nx' base plain
+
+# ── 行程層級 ──
+LDAP_PW='S3cret"\x'"'"'#&!'
+ldap_setup() { # ldap_setup <名稱>：沙盒加上 nc／ldapsearch／gitlab-rake 假指令
+    setup_sandbox "$1"
+    make_stub "$SB/bin" nc 'exit "${STUB_NC_RC:-0}"'
+    make_stub "$SB/bin" ldapsearch 'for a in "$@"; do if [ "$prev" = -y ]; then cat "$a" >"'"$SB"'/pwfile.seen"; stat -c %a "$a" >"'"$SB"'/pwfile.mode"; fi; prev="$a"; done; exit "${STUB_LDAP_RC:-0}"'
+    make_stub "$SB/bin" gitlab-rake 'echo "Checking LDAP ..."; echo "LDAP authentication... Success"; exit "${STUB_RAKE_RC:-0}"'
+    chmod 644 "$SB/gitlab.rb"
+}
+ldap_in() { # ldap_in <host> <mode> <port>：選單 10 的輸入（用字面 \n，交給 run_ins 的 printf %b 展開；$(…) 會吃掉結尾換行）
+    printf '10\\n%s\\n%s\\n%s\\nCN=gitlab_svc,OU=Service Accounts,DC=example,DC=com\\nOU=Users,DC=example,DC=com\\n%s\\n' "$1" "$2" "$3" "${LDAP_PW//$bs/$bs$bs}"
+}
+
+ldap_setup ldap_ok
+out="$(run_ins "$(ldap_in 192.168.9.10 plain '')q\n")"
+rb="$(cat "$SB/gitlab.rb")"
+assert_contains "$rb" "# >>> gitlab-ops:install_ldap BEGIN" "寫入 install_ldap 區塊"
+assert_contains "$rb" "'host'                          => '192.168.9.10'," "gitlab.rb 有 host"
+assert_contains "$rb" "'port'                          => 389," "plain 預設 port 389"
+assert_contains "$rb" "'password'                      => 'S3cret\"\\\\x\\'#&!'," "gitlab.rb 內密碼已正確跳脫"
+assert_eq "600" "$(stat -c %a "$SB/gitlab.rb")" "gitlab.rb 權限 600（原本是 644）"
+assert_eq "600" "$(stat -c %a "$(ls "$SB"/gitlab.rb.bak-* | head -n1)")" "備份檔權限 600"
+assert_eq "1" "$(count_log '^gitlab-ctl reconfigure')" "reconfigure 一次"
+assert_eq "1" "$(count_log '^gitlab-rake gitlab:ldap:check')" "reconfigure 後執行 gitlab:ldap:check"
+assert_contains "$out" "LDAP authentication... Success" "顯示檢查結果"
+assert_contains "$out" "AD Login" "成功訊息"
+assert_contains "$(cat "$STUB_LOG")" "nc -zv -w 5 -- 192.168.9.10 389" "先用 nc -zv 測連線"
+assert_contains "$(cat "$STUB_LOG")" "ldapsearch -x -H ldap://192.168.9.10:389" "有 ldapsearch：試 bind（ldap://）"
+assert_eq "$LDAP_PW" "$(cat "$SB/pwfile.seen")" "密碼透過密碼檔傳給 ldapsearch（逐字）"
+assert_eq "600" "$(cat "$SB/pwfile.mode")" "密碼檔權限 600"
+# 密碼不外洩（PR-COM-06）
+assert_not_contains "$out" "S3cret" "終端輸出不含密碼"
+assert_contains "$out" "********" "預覽以 ******** 代替密碼"
+assert_not_contains "$(cat "$STUB_LOG")" "S3cret" "指令列（stub 記錄）不含密碼"
+assert_not_contains "$(cat "$OPS_ENV_FILE")" "S3cret" "參數檔不含密碼"
+assert_contains "$(cat "$OPS_ENV_FILE")" "INS_LDAP_HOST=192.168.9.10" "非敏感參數存入參數檔"
+assert_contains "$(cat "$OPS_ENV_FILE")" "INS_LDAP_BASE=OU=Users,DC=example,DC=com" "Base DN 存入參數檔"
+assert_eq "0" "$(find "$SB/tmp" -type f 2>/dev/null | wc -l | tr -d " ")" "暫存的密碼檔已刪除"
+
+# 重跑：區塊仍只有一段
+out="$(run_ins "$(ldap_in 192.168.9.10 plain '')q\n")"
+assert_eq "1" "$(grep -c 'gitlab-ops:install_ldap BEGIN' "$SB/gitlab.rb")" "重跑仍只有一段 LDAP 區塊"
+
+# 加密模式與 port
+ldap_setup ldap_tls
+out="$(run_ins "$(ldap_in ad.example.com simple_tls '')q\n")"
+assert_contains "$(cat "$SB/gitlab.rb")" "'port'                          => 636," "simple_tls 預設 636"
+assert_contains "$(cat "$SB/gitlab.rb")" "'encryption'                    => 'simple_tls'," "simple_tls 寫入"
+assert_contains "$(cat "$STUB_LOG")" "ldapsearch -x -H ldaps://ad.example.com:636" "simple_tls 用 ldaps://"
+ldap_setup ldap_starttls
+out="$(run_ins "$(ldap_in 1.2.3.4 start_tls '')q\n")"
+assert_contains "$(cat "$STUB_LOG")" "ldapsearch -x -ZZ -H ldap://1.2.3.4:389" "start_tls 用 -ZZ 與 389"
+assert_contains "$(cat "$SB/gitlab.rb")" "'port'                          => 389," "start_tls port 389"
+# 先選 plain 再改 simple_tls：不會沿用 plain 存下的 389
+ldap_setup ldap_switch
+out="$(run_ins "$(ldap_in 1.2.3.4 plain '')q\n")"
+out="$(run_ins "$(ldap_in 1.2.3.4 simple_tls '')q\n")"
+assert_contains "$(cat "$SB/gitlab.rb")" "'port'                          => 636," "改成 simple_tls 後預設回到 636"
+# 自訂 port
+ldap_setup ldap_port
+out="$(run_ins "$(ldap_in 1.2.3.4 plain 3268)q\n")"
+assert_contains "$(cat "$SB/gitlab.rb")" "'port'                          => 3268," "自訂 port"
+
+# 連線測試失敗
+ldap_setup ldap_nc_no
+out="$(run_ins "$(ldap_in 192.168.9.10 plain '')no\nq\n" STUB_NC_RC=1)"
+assert_file_eq "$SB/gitlab.rb.orig" "$SB/gitlab.rb" "連不上＋回答 no：gitlab.rb 不動"
+assert_eq "0" "$(count_log '^gitlab-ctl')" "連不上＋回答 no：不 reconfigure"
+assert_not_contains "$out" "S3cret" "連不上：不印密碼"
+ldap_setup ldap_nc_eof
+out="$(run_ins "$(ldap_in 192.168.9.10 plain '')" STUB_NC_RC=1)"
+assert_file_eq "$SB/gitlab.rb.orig" "$SB/gitlab.rb" "連不上＋EOF：gitlab.rb 不動"
+ldap_setup ldap_nc_yes
+out="$(run_ins "$(ldap_in 192.168.9.10 plain '')yes\nq\n" STUB_NC_RC=1)"
+assert_contains "$(cat "$SB/gitlab.rb")" "gitlab-ops:install_ldap BEGIN" "連不上＋yes：照寫"
+assert_eq "0" "$(count_log '^ldapsearch')" "連不上：不再試 bind"
+# bind 失敗
+ldap_setup ldap_bind_no
+out="$(run_ins "$(ldap_in 192.168.9.10 plain '')no\nq\n" STUB_LDAP_RC=49)"
+assert_file_eq "$SB/gitlab.rb.orig" "$SB/gitlab.rb" "bind 失敗＋no：gitlab.rb 不動"
+assert_contains "$out" "bind 失敗" "bind 失敗：有說明"
+assert_not_contains "$out" "S3cret" "bind 失敗：不印密碼"
+ldap_setup ldap_bind_yes
+out="$(run_ins "$(ldap_in 192.168.9.10 plain '')yes\nq\n" STUB_LDAP_RC=49)"
+assert_contains "$(cat "$SB/gitlab.rb")" "gitlab-ops:install_ldap BEGIN" "bind 失敗＋yes：照寫"
+# 沒有 ldapsearch：略過 bind、仍寫入（用 have_cmd 無法跨行程覆寫，直接移除 stub 並確認系統沒有）
+ldap_setup ldap_no_ldapsearch
+rm -f "$SB/bin/ldapsearch"
+if ! command -v ldapsearch >/dev/null 2>&1; then
+    out="$(run_ins "$(ldap_in 192.168.9.10 plain '')q\n")"
+    assert_contains "$out" "略過 bind 測試" "沒有 ldapsearch：略過 bind 測試"
+    assert_contains "$(cat "$SB/gitlab.rb")" "gitlab-ops:install_ldap BEGIN" "沒有 ldapsearch：仍寫入"
+fi
+# ldap:check 失敗
+ldap_setup ldap_check_fail
+out="$(run_ins "$(ldap_in 192.168.9.10 plain '')q\n" STUB_RAKE_RC=1)"
+assert_contains "$out" "gitlab:ldap:check 失敗" "ldap:check 失敗：說明"
+assert_contains "$out" "動作未完成" "ldap:check 失敗：動作回報失敗"
+assert_not_contains "$out" "已設定並通過檢查" "ldap:check 失敗：不宣稱成功"
+# reconfigure 失敗：不跑 ldap:check
+ldap_setup ldap_reconf_fail
+out="$(run_ins "$(ldap_in 192.168.9.10 plain '')yes\nq\n" STUB_RECONF_RC=1)"
+assert_eq "0" "$(count_log '^gitlab-rake')" "reconfigure 失敗：不跑 ldap:check"
+assert_file_eq "$SB/gitlab.rb.orig" "$SB/gitlab.rb" "reconfigure 失敗＋yes：還原為原檔"
+assert_not_contains "$out" "S3cret" "reconfigure 失敗：不印密碼"
+# 輸入不合法
+ldap_setup ldap_bad_in
+out="$(run_ins "10\nbad;host\n1.2.3.4\nssl\nplain\n70000\n389\nq\n")"
+assert_eq "0" "$(count_log '^gitlab-ctl')" "不合法輸入後 EOF：不 reconfigure"
+# 非 root／未裝 GitLab
+ldap_setup ldap_nonroot
+out="$(run_ins "$(ldap_in 192.168.9.10 plain '')q\n" OPS_FAKE_UID=1000)"
+assert_file_eq "$SB/gitlab.rb.orig" "$SB/gitlab.rb" "非 root：gitlab.rb 不動"
+ldap_setup ldap_nogl
+rmdir "$SB/opt"
+out="$(run_ins "$(ldap_in 192.168.9.10 plain '')q\n")"
+assert_contains "$out" "【GitLab 伺服器】" "未裝 GitLab：指向【GitLab 伺服器】"
+
+# 說明與排查
+help="$(run_ins '11\nq\n')"
+for k in "Bind DN" "Base DN" start_tls simple_tls 636 gitlab:ldap:check 600; do assert_contains "$help" "$k" "說明含：$k"; done
+fix="$(run_ins '12\nq\n')"
+for k in "Connection timed out" "Invalid credentials" "Base DN" trusted-certs "nc -zv" ldapsearch; do assert_contains "$fix" "$k" "排查含：$k"; done
+menu="$(run_ins 'q\n')"
+assert_contains "$menu" "LDAP" "選單含 LDAP"

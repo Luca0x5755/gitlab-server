@@ -17,6 +17,7 @@ _ins_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INS_REPO_SCRIPT_URL="https://packages.gitlab.com/install/repositories/gitlab/gitlab-ce/script.deb.sh"
 INS_URL_BLOCK="install_external_url"
 INS_HTTPS_BLOCK="install_https"
+INS_LDAP_BLOCK="install_ldap"
 
 # ── 驗證與解析（純函式）──────────────────────────────────────────────────────
 
@@ -137,6 +138,59 @@ external_url_host() {
     echo "${BASH_REMATCH[1]}"
 }
 
+# ── LDAP（純函式）────────────────────────────────────────────────────────────
+
+valid_ldap_mode() { [[ $1 == plain || $1 == start_tls || $1 == simple_tls ]]; }
+
+# 加密模式對應的預設 port：plain 與 start_tls 走 389，simple_tls（LDAPS）走 636。
+ldap_default_port() {
+    case "$1" in
+        plain | start_tls) echo 389 ;;
+        simple_tls) echo 636 ;;
+        *) return 1 ;;
+    esac
+}
+
+valid_port() { [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && [ "$1" -le 65535 ]; }
+
+# 值會放進 gitlab.rb 的 Ruby 單引號字串：不得含換行等控制字元；其餘以 ruby_sq 跳脫。
+valid_ldap_text() { [ -n "$1" ] && [[ $1 != *[[:cntrl:]]* ]]; }
+
+# Ruby 單引號字串內只有 \ 和 ' 需要跳脫。
+ruby_sq() {
+    local v="${1//\\/\\\\}"
+    printf '%s' "${v//\'/\\\'}"
+}
+
+# LDAP 管理區塊內容：render_ldap_block <host> <port> <bind_dn> <password> <base> <mode>。
+# 內容含 bind 密碼，所以呼叫端只能把它傳給 apply_managed_block，不可印出（預覽請傳假密碼）。
+render_ldap_block() {
+    local host="$1" port="$2" dn="$3" pw="$4" base="$5" mode="$6"
+    valid_cert_host "$host" || return 1
+    valid_port "$port" || return 1
+    valid_ldap_mode "$mode" || return 1
+    valid_ldap_text "$dn" && valid_ldap_text "$base" && valid_ldap_text "$pw" || return 1
+    cat <<RB
+gitlab_rails['ldap_enabled'] = true
+
+gitlab_rails['ldap_servers'] = {
+  'main' => {
+    'label'                         => 'AD Login',
+    'host'                          => '$host',
+    'port'                          => $port,
+    'uid'                           => 'sAMAccountName',
+    'bind_dn'                       => '$(ruby_sq "$dn")',
+    'password'                      => '$(ruby_sq "$pw")',
+    'encryption'                    => '$mode',
+    'active_directory'              => true,
+    'base'                          => '$(ruby_sq "$base")',
+    'allow_username_or_email_login' => true,
+    'block_auto_created_users'      => false,
+  }
+}
+RB
+}
+
 # 取出 initial_root_password 檔中 `Password:` 後的值（純 bash 前綴剝除，值原樣輸出）。
 # 找不到或值為空回非 0 且不輸出，由呼叫端退回「請 sudo cat 該檔」。
 extract_initial_password() {
@@ -203,7 +257,14 @@ GitLab 伺服器通常不能連外，所以分兩台機器作業：
     的主機一致。自簽憑證瀏覽器會顯示警告，需手動信任或改用正式憑證。
   - external_url 與 HTTPS 導向寫在同一個管理區塊（install_https）。HTTPS 啟用期間，
     選單 6 會拒絕執行；要改回 http 請先用選單 9 停用 HTTPS。
-  - 外部 Nginx 請用 nginx.sh；LDAP 由本腳本後續選單項目提供。
+  - AD (LDAP) 登入（選單 10）：先向 AD 管理員取得 AD 伺服器 IP、Port（389 明文／636 SSL）、
+    Bind DN（服務帳號的完整 DN）、Bind 密碼、Base DN（要搜尋使用者的 OU 範圍）。
+    加密模式：plain（389，明文，適合內網且無憑證）、start_tls（389，在明文連線上啟動 TLS）、
+    simple_tls（636，直接 SSL；Port 要用 636）。腳本會先測連線，再以管理區塊（install_ldap）
+    寫入 gitlab.rb、reconfigure，最後執行 gitlab-rake gitlab:ldap:check。
+    Bind 密碼只能以明文寫在 gitlab.rb（GitLab 設定格式的限制）：腳本用隱藏輸入取得，
+    不寫入參數檔、不印到終端，並把 gitlab.rb 與備份檔設為 600。
+  - 外部 Nginx 請用 nginx.sh。
 TXT
 }
 
@@ -231,6 +292,16 @@ show_troubleshooting() {
   reconfigure 後仍用 http、或憑證找不到：憑證檔名必須是 <external_url 的主機>.crt／.key，
     放在 /etc/gitlab/ssl；伺服器 IP 或網域改了，要重新執行選單 8 產生新憑證。
   想改回 http：執行選單 9 停用 HTTPS（只移除 HTTPS 區塊；ufw 的 443 規則不動）。
+  LDAP（選單 10）排查：
+    Connection timed out：防火牆阻擋或 IP 錯誤。用 nc -zv <AD_IP> 389 測試連線。
+    Bind failed／Invalid credentials：Bind DN 或密碼錯誤。用 ldapsearch -x -H ldap://<AD_IP> -D "<Bind DN>" -W
+      -b "<Base DN>" "(sAMAccountName=testuser)" 手動測 bind；沒有 ldapsearch 可先用 nc -zv 測連線。
+    找不到使用者：Base DN 範圍不對，確認使用者所在 OU 是否在 Base DN 之下。
+    SSL 憑證錯誤：AD 使用自簽憑證。把 CA 憑證放到 /etc/gitlab/trusted-certs/ 後
+      sudo gitlab-ctl reconfigure。
+    simple_tls 連不上：Port 要用 636，且 AD 須已啟用 LDAPS。
+    成功時：gitlab-rake gitlab:ldap:check 會顯示「LDAP authentication... Success」，
+      登入頁出現「AD Login」分頁。
   想還原 gitlab.rb：備份在 /etc/gitlab/gitlab.rb.bak-時間戳，複製回 gitlab.rb 後
     執行 sudo gitlab-ctl reconfigure。
 TXT
@@ -373,6 +444,93 @@ enable_https() {
     echo "✓ HTTPS 已啟用：https://$host （自簽憑證，瀏覽器會警告，屬預期）。"
 }
 
+# TCP 連線測試：優先用 nc（文件的 nc -zv），沒有就用 bash 的 /dev/tcp。
+tcp_check() { # tcp_check <主機> <port>
+    if have_cmd nc; then
+        nc -zv -w 5 -- "$1" "$2"
+    else
+        timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$1" "$2"
+    fi
+}
+
+# 有 ldapsearch 時試 bind。密碼走 -y 密碼檔（umask 077 暫存檔，用完即刪），不上命令列。
+ldap_bind_test() { # ldap_bind_test <host> <port> <bind_dn> <password> <base> <mode>
+    local host="$1" port="$2" dn="$3" pw="$4" base="$5" mode="$6" scheme=ldap pwf rc=0
+    local -a extra=()
+    [ "$mode" != simple_tls ] || scheme=ldaps
+    [ "$mode" != start_tls ] || extra=(-ZZ)
+    pwf="$(umask 077 && mktemp)" || return 1
+    printf '%s' "$pw" >"$pwf"
+    ldapsearch -x "${extra[@]}" -H "$scheme://$host:$port" -D "$dn" -y "$pwf" -b "$base" -s base -l 10 '(objectClass=*)' >/dev/null || rc=$?
+    rm -f "$pwf"
+    return "$rc"
+}
+
+# 隱藏輸入的 bind 密碼，結果放進全域 _ldap_pw（不走 stdout／參數檔／環境變數）。
+read_ldap_password() {
+    _ldap_pw=""
+    read -r -s -p "bind 密碼（不會顯示、不會存檔）：" _ldap_pw || { echo >&2; die "沒有讀到密碼，已取消。"; }
+    echo >&2
+    valid_ldap_text "$_ldap_pw" || die "密碼不可為空，也不可含換行等控制字元。"
+}
+
+setup_ldap() {
+    local host mode port dn base preview body rc=0 f mode_bits check_rc=0 line
+    ins_require_gitlab_host
+    require_root
+    host="$(ask_param INS_LDAP_HOST "AD 伺服器 IP 或主機名" "" valid_cert_host)"
+    mode="$(ask_param INS_LDAP_MODE "加密模式（plain／start_tls／simple_tls）" "plain" valid_ldap_mode)"
+    port="$(ask_param "INS_LDAP_PORT_${mode^^}" "Port" "$(ldap_default_port "$mode")" valid_port)"
+    dn="$(ask_param INS_LDAP_BIND_DN "Bind DN（例 CN=gitlab_svc,OU=Service Accounts,DC=example,DC=com）" "" valid_ldap_text)"
+    base="$(ask_param INS_LDAP_BASE "Base DN（例 OU=Users,DC=example,DC=com）" "" valid_ldap_text)"
+    read_ldap_password
+
+    echo "測試連線 $host:$port ..."
+    if ! tcp_check "$host" "$port"; then
+        echo "⚠ 連不上 $host:$port（防火牆、IP 或 port 可能不對）。" >&2
+        confirm "仍要寫入設定嗎？" || { echo "已取消，未做任何變更。"; return 0; }
+    elif have_cmd ldapsearch; then
+        echo "測試 bind ..."
+        if ldap_bind_test "$host" "$port" "$dn" "$_ldap_pw" "$base" "$mode"; then
+            echo "  bind 成功。"
+        else
+            echo "⚠ bind 失敗（Bind DN／密碼／Base DN 或加密模式可能不對）。" >&2
+            confirm "仍要寫入設定嗎？" || { _ldap_pw=""; echo "已取消，未做任何變更。"; return 0; }
+        fi
+    else
+        echo "  （沒有 ldapsearch，略過 bind 測試；reconfigure 後會用 gitlab:ldap:check 驗證。）"
+    fi
+
+    body="$(render_ldap_block "$host" "$port" "$dn" "$_ldap_pw" "$base" "$mode")" || die "設定值不合法，未寫入。"
+    preview="$(render_ldap_block "$host" "$port" "$dn" "********" "$base" "$mode")"
+    echo "將在 $(gitlab_rb_file) 以管理區塊（$INS_LDAP_BLOCK）寫入（密碼以 ******** 代替）："
+    while IFS= read -r line; do echo "    $line"; done <<<"$preview"
+
+    # 區塊含密碼：先把 gitlab.rb 收緊成 root 專用，再寫入（備份檔由 backup_gitlab_rb 建成 600）。
+    f="$(gitlab_rb_file)"
+    chmod 600 "$f" || die "無法把 $f 設為 600，未寫入密碼。"
+    apply_managed_block "$INS_LDAP_BLOCK" "$body" || rc=$?
+    _ldap_pw=""
+    body=""
+    case "$rc" in
+        0) ;;
+        1) echo "✗ reconfigure 失敗，見上方說明。" >&2; return 1 ;;
+        3) echo "✗ 寫入 gitlab.rb 失敗，已自動還原。" >&2; return 3 ;;
+        *) echo "✗ 未寫入任何變更。" >&2; return "$rc" ;;
+    esac
+    mode_bits="$(stat -c %a "$f" 2>/dev/null || true)"
+    [ "$mode_bits" = 600 ] || echo "⚠ $f 的權限是 ${mode_bits:-未知}，內含 bind 密碼，請改為 600：sudo chmod 600 $f" >&2
+
+    echo "執行 gitlab-rake gitlab:ldap:check ..."
+    gitlab-rake gitlab:ldap:check || check_rc=$?
+    if [ "$check_rc" -eq 0 ]; then
+        echo "✓ LDAP 已設定並通過檢查；登入頁會出現「AD Login」分頁。"
+    else
+        echo "✗ gitlab:ldap:check 失敗（結束碼 $check_rc）。設定已寫入；原因請對照選單的「常見問題排查」。" >&2
+        return 1
+    fi
+}
+
 disable_https() {
     local rc=0
     ins_require_gitlab_host
@@ -427,8 +585,9 @@ show_menu() {
   7) 顯示 root 初始密碼            【GitLab 伺服器】
   8) 啟用 HTTPS（自簽憑證）        【GitLab 伺服器】
   9) 停用 HTTPS                    【GitLab 伺服器】
-  10) 說明
-  11) 常見問題排查
+  10) 設定 AD (LDAP) 登入         【GitLab 伺服器】
+  11) 說明
+  12) 常見問題排查
   q) 離開
 TXT
 }
@@ -444,8 +603,9 @@ dispatch() {
         7) show_initial_password ;;
         8) enable_https ;;
         9) disable_https ;;
-        10) show_help ;;
-        11) show_troubleshooting ;;
+        10) setup_ldap ;;
+        11) show_help ;;
+        12) show_troubleshooting ;;
         *) echo "✗ 無此選項：$1" >&2 ;;
     esac
 }
