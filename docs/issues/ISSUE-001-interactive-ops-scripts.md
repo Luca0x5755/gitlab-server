@@ -14,7 +14,7 @@ GitLab 離線安裝、備份還原、升級、外部 Nginx、固定 IP 目前是
 - PR-COM-03 — 破壞性操作須輸入 `yes`；stdin 讀到 EOF 視為否。
 - PR-COM-04 — 選單項目標示「【有網路的電腦】」或「【GitLab 伺服器】」；環境不符（無 `apt`、無 `/opt/gitlab`）時中止，並說明應在哪台執行。
 - PR-COM-05 — 參數詢問帶預設值，Enter 沿用上次答案；答案存入 `scripts/gitlab-ops.env`，該檔列入 `.gitignore`。
-- PR-COM-06 — 任何密碼不寫入 `gitlab-ops.env`，也不印到終端。
+- PR-COM-06 — 任何密碼不寫入 `gitlab-ops.env`，也不印到終端（唯一例外：PR-INS-05 顯示的 `initial_root_password` 那一行，見 `docs/decision-log.md`）。
 - PR-COM-07 — 改 `gitlab.rb` 前先備份為 `gitlab.rb.bak-<時間戳>`；管理區塊重跑時整段取代，區塊外內容不變。
 - PR-COM-08 — `reconfigure` 失敗時詢問是否還原備份。
 - PR-COM-09 — `make_self_signed_cert` 不互動、含 SAN；參數是 IP 用 `IP:`，是網域用 `DNS:`。
