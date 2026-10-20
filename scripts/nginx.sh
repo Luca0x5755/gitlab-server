@@ -526,9 +526,9 @@ ngx_prepare_cert() {
         copy)
             from_crt="$(ssl_dir)/$host.crt"
             from_key="$(ssl_dir)/$host.key"
-            [ -f "$from_crt" ] && [ -f "$from_key" ] || die "找不到 $from_crt 或 $from_key。請改選 generate，或先到 install.sh 選單 8 產生。"
+            if [ ! -f "$from_crt" ] || [ ! -f "$from_key" ]; then die "找不到 $from_crt 或 $from_key。請改選 generate，或先到 install.sh 選單 8 產生。"; fi
             ( umask 077 && mkdir -p "$dir" && cp -- "$from_crt" "$crt" && cp -- "$from_key" "$key" ) || die "複製憑證失敗。"
-            chmod 600 "$key" && chmod 644 "$crt" || die "設定憑證權限失敗。"
+            if ! { chmod 600 "$key" && chmod 644 "$crt"; }; then die "設定憑證權限失敗。"; fi
             echo "  已複製：$from_crt → $crt"
             echo "  已複製：$from_key → $key"
             ;;
@@ -568,7 +568,7 @@ ngx_configure_proxy() {
     crt="$(ngx_ssl_dir)/$host.crt"
     key="$(ngx_ssl_dir)/$host.key"
     if [ "$scheme" = https ]; then
-        [ -f "$crt" ] && [ -f "$key" ] || die "找不到憑證 $crt 或 $key。請先執行選單 5 準備憑證。"
+        if [ ! -f "$crt" ] || [ ! -f "$key" ]; then die "找不到憑證 $crt 或 $key。請先執行選單 5 準備憑證。"; fi
         body="$(render_nginx_conf https "$host" "$crt" "$key")" || die "設定值不合法，未寫入。"
     else
         echo "⚠ HTTP 模式沒有加密，僅供測試或內網無加密需求。"

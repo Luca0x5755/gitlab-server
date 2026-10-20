@@ -581,7 +581,7 @@ ldap_setup() { # ldap_setup <名稱>：沙盒加上 nc／ldapsearch／gitlab-rak
     chmod 644 "$SB/gitlab.rb"
 }
 ldap_in() { # ldap_in <host> <mode> <port>：選單 10 的輸入（用字面 \n，交給 run_ins 的 printf %b 展開；$(…) 會吃掉結尾換行）
-    printf '10\\n%s\\n%s\\n%s\\nCN=gitlab_svc,OU=Service Accounts,DC=example,DC=com\\nOU=Users,DC=example,DC=com\\n%s\\n' "$1" "$2" "$3" "${LDAP_PW//$bs/$bs$bs}"
+    printf '10\\n%s\\n%s\\n%s\\nCN=gitlab_svc,OU=Service Accounts,DC=example,DC=com\\nOU=Users,DC=example,DC=com\\n%s\\n' "$1" "$2" "$3" "${LDAP_PW//"$bs"/"$bs$bs"}"
 }
 
 ldap_setup ldap_ok

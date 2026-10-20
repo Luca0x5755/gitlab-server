@@ -417,7 +417,7 @@ enable_https() {
     else
         make_self_signed_cert "$host"
     fi
-    [ -f "$crt" ] && [ -f "$key" ] || die "找不到憑證 $crt 或 $key，未修改 gitlab.rb。"
+    if [ ! -f "$crt" ] || [ ! -f "$key" ]; then die "找不到憑證 $crt 或 $key，未修改 gitlab.rb。"; fi
     body="$(render_https_block "$host")"
     echo "將在 $(gitlab_rb_file) 以管理區塊（$INS_HTTPS_BLOCK）寫入："
     while IFS= read -r line; do echo "    $line"; done <<<"$body"
@@ -441,6 +441,8 @@ tcp_check() { # tcp_check <主機> <port>
     if have_cmd nc; then
         nc -zv -w 5 -- "$1" "$2"
     else
+        # 單引號是刻意的：變數交給子 shell 以位置參數展開
+        # shellcheck disable=SC2016
         timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$1" "$2"
     fi
 }
