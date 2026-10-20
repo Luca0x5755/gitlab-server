@@ -147,3 +147,256 @@ menu_loop() {
         echo
     done
 }
+
+# ── 版本字串（純函式；ISSUE-007／008 直接使用，勿另行定義）──────────────────────
+
+# 版本轉成可字串比較的鍵：主.次.修[-ce.N]，各段補零到 10 位；無 -ce 後綴視同 -ce.0。
+# 非法格式回非 0 且不輸出。各段最多 9 位數，避免溢位。
+_version_key() {
+    local re='^([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})(-ce\.([0-9]{1,9}))?$'
+    [[ $1 =~ $re ]] || return 1
+    printf '%010d.%010d.%010d.%010d\n' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))" \
+        "$((10#${BASH_REMATCH[3]}))" "$((10#${BASH_REMATCH[5]:-0}))"
+}
+
+# version_cmp <a> <b>：輸出 -1／0／1；兩者都合法回 0，任一非法回 1 且不輸出。
+# 用數值比較（18.7 < 18.10），不可用字串排序。
+version_cmp() {
+    local ka kb
+    ka="$(_version_key "$1")" || return 1
+    kb="$(_version_key "$2")" || return 1
+    if [[ $ka < $kb ]]; then echo -1; elif [[ $ka > $kb ]]; then echo 1; else echo 0; fi
+}
+
+# sort_versions <asc|desc>：stdin 一行一版本，stdout 排序後；有非法行回非 0 且不輸出。
+sort_versions() {
+    local dir="${1:-}" line key keyed=""
+    case "$dir" in asc | desc) ;; *) echo "✗ sort_versions：方向須為 asc 或 desc" >&2; return 2 ;; esac
+    while IFS= read -r line || [ -n "$line" ]; do
+        key="$(_version_key "$line")" || { echo "✗ 非法版本字串：$line" >&2; return 1; }
+        keyed+="$key"$'\t'"$line"$'\n'
+    done
+    [ -n "$keyed" ] || return 0
+    if [ "$dir" = asc ]; then
+        printf '%s' "$keyed" | LC_ALL=C sort | cut -f2-
+    else
+        printf '%s' "$keyed" | LC_ALL=C sort -r | cut -f2-
+    fi
+}
+
+# ── gitlab.rb 管理區塊 ───────────────────────────────────────────────────────
+# 管理區塊是腳本寫進 gitlab.rb、以標記行包夾的一段設定；區塊名稱是參數，
+# 各票（external_url、HTTPS、LDAP、備份保留、外部 Nginx）用不同名稱重用本分區。
+#   # >>> gitlab-ops:<name> BEGIN 腳本維護，重跑整段取代，請勿手改
+#   …內容…
+#   # <<< gitlab-ops:<name> END
+# 辨識只比對前綴，其後須是行尾或空白／Tab 開頭，所以尾巴說明文字日後可改。
+# 內容（可能含 LDAP bind 密碼）只在 bash 變數與 umask 077 暫存檔間流動，
+# 絕不經 awk -v／sed 替換字串／外部指令的 argv，也絕不印出。
+
+valid_block_name() { [[ $1 =~ ^[a-z][a-z0-9_]*$ ]]; }
+
+# 判斷一行相對於區塊 <name> 是什麼：結果放進全域 _bk（begin／end／bad／none），
+# 避免每行開子 shell。標記前綴後緊接 CR（Windows 換行）視為 bad。
+_block_kind() { # _block_kind <行> <name>
+    local b="# >>> gitlab-ops:$2 BEGIN" e="# <<< gitlab-ops:$2 END" rest
+    _bk=none
+    if [[ $1 == "$b"* ]]; then
+        rest="${1#"$b"}"
+        case "$rest" in "" | " "* | $'\t'*) _bk=begin ;; $'\r'*) _bk=bad ;; esac
+    elif [[ $1 == "$e"* ]]; then
+        rest="${1#"$e"}"
+        case "$rest" in "" | " "* | $'\t'*) _bk=end ;; $'\r'*) _bk=bad ;; esac
+    fi
+}
+
+# 組出含標記行的整段，放進全域 _rb（保留結尾換行）。內容的任一行以標記前綴開頭即拒絕。
+_render_block_var() { # _render_block_var <name> <內容>
+    local line
+    valid_block_name "$1" || { echo "✗ 區塊名稱不合法：$1" >&2; return 1; }
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ $line == "# >>> gitlab-ops:"* || $line == "# <<< gitlab-ops:"* ]]; then
+            echo "✗ 區塊內容不可含管理區塊標記行。" >&2
+            return 1
+        fi
+    done <<<"$2"
+    _rb="# >>> gitlab-ops:$1 BEGIN 腳本維護，重跑整段取代，請勿手改"$'\n'
+    [ -z "$2" ] || _rb+="$2"$'\n'
+    _rb+="# <<< gitlab-ops:$1 END"$'\n'
+}
+
+render_block() { # render_block <name> <內容>：stdout 為整段
+    local _rb
+    _render_block_var "$1" "$2" || return 1
+    printf '%s' "$_rb"
+}
+
+# 掃描檔案找出 <name> 區塊：設定 _bl_lines（各行）、_bl_b／_bl_e（BEGIN／END 的索引，無則 -1）、
+# _bl_nonl（檔案非空且缺結尾換行為 1）。標記毀損回 1（只有 BEGIN、只有 END、同名多段、
+# 順序顛倒、巢狀、標記帶 CR）。
+_block_scan() { # _block_scan <檔> <name>
+    local i n state=0
+    valid_block_name "$2" || return 1
+    _bl_b=-1
+    _bl_e=-1
+    _bl_lines=()
+    mapfile -t _bl_lines <"$1" || return 1
+    _bl_nonl=0
+    if [ -s "$1" ] && [ -n "$(tail -c1 "$1")" ]; then _bl_nonl=1; fi
+    n="${#_bl_lines[@]}"
+    for ((i = 0; i < n; i++)); do
+        _block_kind "${_bl_lines[i]}" "$2"
+        case "$_bk" in
+            none) ;;
+            begin) [ "$state" -eq 0 ] || return 1; _bl_b=$i; state=1 ;;
+            end) [ "$state" -eq 1 ] || return 1; _bl_e=$i; state=2 ;;
+            *) return 1 ;;
+        esac
+    done
+    [ "$state" -ne 1 ]
+}
+
+# 把 _bl_lines 的 [from, to) 附加到 _out；檔尾那一行若原檔缺換行就維持缺。
+_emit_lines() { # _emit_lines <from> <to>
+    local i n="${#_bl_lines[@]}"
+    for ((i = $1; i < $2; i++)); do
+        if [ "$i" -eq $((n - 1)) ] && [ "$_bl_nonl" -eq 1 ]; then
+            _out+="${_bl_lines[i]}"
+        else
+            _out+="${_bl_lines[i]}"$'\n'
+        fi
+    done
+}
+
+# replace_block <檔> <name> <內容>：stdout 為新檔全文，不寫檔。有區塊→整段取代；沒有→追加檔尾。
+# 區塊外的 byte 不變（追加時只在舊檔缺結尾換行時補一個換行）。標記毀損或內容不合法回非 0 且不輸出。
+replace_block() {
+    local _rb _out="" n
+    _render_block_var "$2" "$3" || return 1
+    _block_scan "$1" "$2" || { echo "✗ $1 的管理區塊標記毀損（$2），不處理。" >&2; return 1; }
+    n="${#_bl_lines[@]}"
+    if [ "$_bl_b" -ge 0 ]; then
+        _emit_lines 0 "$_bl_b"
+        _out+="$_rb"
+        _emit_lines $((_bl_e + 1)) "$n"
+    else
+        _emit_lines 0 "$n"
+        [ "$_bl_nonl" -eq 0 ] || _out+=$'\n'
+        _out+="$_rb"
+    fi
+    printf '%s' "$_out"
+}
+
+# strip_block <檔> <name>：stdout 為移除該區塊後的全文；無此區塊→原樣。標記毀損回非 0。
+strip_block() {
+    local _out="" n
+    _block_scan "$1" "$2" || { echo "✗ $1 的管理區塊標記毀損（$2），不處理。" >&2; return 1; }
+    n="${#_bl_lines[@]}"
+    if [ "$_bl_b" -ge 0 ]; then
+        _emit_lines 0 "$_bl_b"
+        _emit_lines $((_bl_e + 1)) "$n"
+    else
+        _emit_lines 0 "$n"
+    fi
+    printf '%s' "$_out"
+}
+
+# block_present <檔> <name>：有完整區塊回 0；沒有或標記毀損回 1。
+block_present() {
+    _block_scan "$1" "$2" 2>/dev/null && [ "$_bl_b" -ge 0 ]
+}
+
+# gitlab.rb 路徑；GITLAB_RB 可由呼叫端（測試）覆寫，與 network.sh 同名。
+gitlab_rb_file() { echo "${GITLAB_RB:-/etc/gitlab/gitlab.rb}"; }
+
+# 時間戳；獨立成函式讓測試能固定它。
+now_stamp() { date +%Y%m%d%H%M%S; }
+
+# 寫入接縫：把暫存檔內容寫進目標（保留目標 inode／權限／擁有者）。測試可覆寫它模擬磁碟滿。
+write_file_from() { cat "$1" >"$2"; }
+
+# 備份 gitlab.rb 為 gitlab.rb.bak-<時間戳>，權限 600（內可能有 LDAP bind 密碼）。
+# 同一秒重複則加 -N 後綴，不覆蓋既有備份。成功時路徑放進全域 LAST_GITLAB_RB_BAK。
+backup_gitlab_rb() {
+    local f ts dest n=1
+    f="$(gitlab_rb_file)"
+    [ -f "$f" ] || { echo "✗ 找不到 $f，無法備份。" >&2; return 1; }
+    ts="$(now_stamp)"
+    dest="$f.bak-$ts"
+    while [ -e "$dest" ]; do
+        n=$((n + 1))
+        dest="$f.bak-$ts-$n"
+    done
+    (umask 077 && cp "$f" "$dest") && chmod 600 "$dest" || { rm -f "$dest"; echo "✗ 備份 $f 失敗。" >&2; return 1; }
+    LAST_GITLAB_RB_BAK="$dest"
+    echo "  已備份：$dest"
+}
+
+# 把備份內容寫回 gitlab.rb。與 write_file_from 互相獨立（正向寫入失敗時還原仍可用）。
+# 失敗回非 0，並印出人工還原的指令（只有路徑，不含內容）。
+restore_gitlab_rb() { # restore_gitlab_rb <備份檔>
+    local f
+    f="$(gitlab_rb_file)"
+    # 先確認備份存在：否則 `cat 不存在的檔 >目標` 會先把目標清空。
+    if [ -f "$1" ] && cat "$1" >"$f"; then
+        echo "  已由 $1 還原 $f。"
+        return 0
+    fi
+    echo "✗ 自動還原失敗，請手動還原：cp '$1' '$f'" >&2
+    return 1
+}
+
+# reconfigure 的薄包裝；獨立成函式讓測試能覆寫（行程層級則用 PATH 上的 gitlab-ctl stub）。
+gitlab_reconfigure() { gitlab-ctl reconfigure; }
+
+# 套用或移除區塊的共同流程。回傳碼：
+#   0 成功；1 reconfigure 失敗；2 事前拒絕（gitlab.rb 保證未動）；3 寫入中途失敗（已自動還原）。
+# 內容只存在變數與 umask 077 的暫存檔，絕不印出。
+_managed_change_run() { # _managed_change_run <暫存檔> <apply|remove> <name> <內容>
+    local tmp="$1" mode="$2" name="$3" content="${4:-}" f bak
+    f="$(gitlab_rb_file)"
+    valid_block_name "$name" || { echo "✗ 區塊名稱不合法：$name" >&2; return 2; }
+    [ -f "$f" ] || { echo "✗ 找不到 $f。" >&2; return 2; }
+    if [ "$mode" = apply ]; then
+        replace_block "$f" "$name" "$content" >"$tmp" || return 2
+    else
+        strip_block "$f" "$name" >"$tmp" || return 2
+        if ! block_present "$f" "$name"; then
+            echo "  $f 沒有管理區塊「$name」，不需移除。"
+            return 0
+        fi
+    fi
+    backup_gitlab_rb || return 2
+    bak="$LAST_GITLAB_RB_BAK"
+    if ! write_file_from "$tmp" "$f"; then
+        echo "✗ 寫入 $f 失敗，自動由備份還原。備份：$bak" >&2
+        restore_gitlab_rb "$bak" || true
+        return 3
+    fi
+    if gitlab_reconfigure; then
+        return 0
+    fi
+    echo "✗ reconfigure 失敗。備份：$bak" >&2
+    if confirm "要把 gitlab.rb 還原為修改前的備份嗎？"; then
+        restore_gitlab_rb "$bak" || true
+        echo "  還原後尚未重新 reconfigure，請確認設定後再執行。"
+    else
+        echo "  未還原，gitlab.rb 保留新內容；需要時可手動還原：cp '$bak' '$f'"
+    fi
+    return 1
+}
+
+_managed_change() { # _managed_change <apply|remove> <name> [內容]
+    local tmp rc=0
+    tmp="$(umask 077 && mktemp)" || { echo "✗ 無法建立暫存檔。" >&2; return 2; }
+    _managed_change_run "$tmp" "$@" || rc=$?
+    rm -f "$tmp"
+    return "$rc"
+}
+
+# apply_managed_block <name> <內容>：備份 → 整段取代（沒有就追加）→ reconfigure。
+# remove_managed_block <name>：備份 → 移除區塊 → reconfigure；區塊不存在回 0 且什麼都不做。
+# 回傳碼見 _managed_change_run。在 menu_loop 的子 shell（set -e）內取碼要寫：
+#   rc=0; apply_managed_block … || rc=$?
+apply_managed_block() { _managed_change apply "$1" "$2"; }
+remove_managed_block() { _managed_change remove "$1"; }
