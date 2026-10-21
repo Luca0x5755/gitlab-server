@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # GitLab 備份選單腳本：立即備份、列出備份、設定資料備份保留 7 天、註冊／移除 crontab、
 # 複製設定備份離機、還原與還原後驗證。只有互動選單，不收參數。
-# 來源文件：docs/02-backup-and-restore.md；說明與排查內容併入本檔。
+# 說明與排查內容見選單項目。
 # 真正做備份的是 backup_auto.sh（cron、升級前、本選單共用同一份）。
 #
 # 頂層只定義函式，不執行任何動作；`set -euo pipefail` 與 `cd` 都在 main 內，

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 外部 Nginx 選單腳本（離線套件）：【有網路的電腦】下載含相依的 .deb 並打包、
 # 【GitLab 伺服器】解包安裝並驗證。只有互動選單，不收參數。
-# 來源文件：docs/04-nginx.md（說明與排查內容併入本檔）；docs/01-install-and-config.md 第三部分
-# 的 gitlab.rb 設定以偵測 nginx.conf 的 user 取代寫死的 www-data（見 docs/decision-log.md）。
+# 說明與排查見選單項目。gitlab.rb 的 external_users
+# 以偵測 nginx.conf 的 user 取代寫死的 www-data（見 docs/decision-log.md）。
 # 停用內建 Nginx、憑證、反向代理設定、驗證與切回內建 Nginx 在本檔後半（選單 4 到 8）。
 #
 # 頂層只定義函式，不執行任何動作；`set -euo pipefail` 與 `cd` 都在 main 內，
@@ -655,7 +655,7 @@ ngx_revert_builtin() {
     return "$rc"
 }
 
-# ── 說明與排查（內容取自 docs/04-nginx.md 與排查表）────────────────
+# ── 說明與排查 ────────────────
 
 show_help() {
     cat <<'TXT'

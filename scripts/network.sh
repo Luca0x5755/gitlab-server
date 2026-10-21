@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 固定 IP（Netplan）選單腳本：列網卡、輸入 IP／閘道／DNS、備份並產生 netplan yaml、驗證後套用。
-# 只有互動選單，不收參數。來源文件：docs/05-network.md（說明與排查內容併入本檔）。
+# 只有互動選單，不收參數。說明與排查見選單項目。
 #
 # 頂層只定義函式，不執行任何動作；`set -euo pipefail` 與 `cd` 都在 main 內，
 # 所以測試可以 source 本檔取得純函式而不啟動選單。
@@ -91,7 +91,7 @@ list_ifaces() {
 # （偏離 PR-COM-04 字面，已記於 docs/decision-log.md。）
 net_check_machine() { require_machine ubuntu netplan ip; }
 
-# ── 說明與排查（內容取自 docs/05-network.md）────────────────────────────────
+# ── 說明與排查 ────────────────────────────────
 
 show_help() {
     cat <<'TXT'

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # GitLab 安裝選單腳本：加來源、列版本、下載 .deb、scp 傳送、dpkg 安裝、設定 external_url、
-# 顯示初始 root 密碼。只有互動選單，不收參數。來源文件：docs/01-install-and-config.md 第一部分
+# 顯示初始 root 密碼。只有互動選單，不收參數。說明與排查見選單項目
 # （HTTPS、LDAP 由後續票追加進本選單；外部 Nginx 屬於 nginx.sh）。
 #
 # 頂層只定義函式，不執行任何動作；`set -euo pipefail` 與 `cd` 都在 main 內，
@@ -217,7 +217,7 @@ ins_require_install_host() { require_machine ubuntu dpkg; }
 # 安裝完成後才有意義的動作（改 gitlab.rb、讀初始密碼）：要求 GitLab 已安裝。
 ins_require_gitlab_host() { require_machine server; }
 
-# ── 說明與排查（內容取自 docs/01-install-and-config.md 第一部分）─────────────
+# ── 說明與排查 ─────────────
 
 show_help() {
     cat <<'TXT'
