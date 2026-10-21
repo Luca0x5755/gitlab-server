@@ -46,3 +46,15 @@ _Avoid_: 附加設定（附加會讓人以為是追加）
 **參數檔**:
 `scripts/gitlab-ops.env`，由腳本維護、列入 `.gitignore`，存 IP、路徑、版本等詢問過的答案。不存任何密碼。
 _Avoid_: 設定檔（容易與 `gitlab.rb`、設定備份混淆）
+
+**Runner**:
+GitLab Runner，領取並執行 CI job 的程序；GitLab 本體不跑 CI。本專案的 Runner 與 GitLab 裝在同一台（機器角色 `server`），用 Docker executor、註冊為 instance runner。
+_Avoid_: CI 環境（沒說清楚是 Runner 還是 job 用的映像檔）、Agent
+
+**Runner token**:
+在後台建立 Runner 後取得、`glrt-` 開頭的 authentication token，`gitlab-runner register` 用它註冊。只存在 Runner 的 `config.toml`，不寫參數檔、日誌、命令列。
+_Avoid_: 註冊 token（舊版 registration token 流程已不用）
+
+**映像包**:
+【有網路的電腦】以 `docker pull`＋`docker save` 打成的單一 tar，內含 CI job 會用到的 image，在【GitLab 伺服器】以 `docker load` 載入，供 `pull_policy = if-not-present` 使用。
+_Avoid_: 映像檔（單指一個 image，而映像包是一整批）
