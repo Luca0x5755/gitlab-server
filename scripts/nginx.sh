@@ -30,19 +30,6 @@ workhorse_socket() { echo "${WORKHORSE_SOCKET:-/var/opt/gitlab/gitlab-workhorse/
 
 # ── 解析（純函式）───────────────────────────────────────────────────
 
-# 從 `apt-cache depends --recurse` 的 stdin 取出要下載的實體套件名（排序去重）。
-# 只收「整行就是一個套件名」的頂層行：
-#   - 縮排行（Depends:／提供者）不是頂層；
-#   - <虛擬套件> 以 < 開頭；
-#   - libc6:i386 這類其他架構含冒號，丟棄（原文件的 grep "^\w" 會放過它）。
-# 沒有任何套件名回非 0，讓呼叫端不會拿空清單去 apt-get download。
-parse_dep_pkgs() {
-    local out
-    out="$(grep -E '^[A-Za-z0-9][A-Za-z0-9.+-]*$' | LC_ALL=C sort -u)" || true
-    [ -n "$out" ] || return 1
-    printf '%s\n' "$out"
-}
-
 # 官方 mainline 來源那一行；keyring 路徑可由 NGX_KEYRING 覆寫（測試用）。
 nginx_apt_source_line() { # nginx_apt_source_line <codename>
     echo "deb [signed-by=${NGX_KEYRING:-$NGX_KEYRING_DEFAULT}] http://nginx.org/packages/mainline/ubuntu $1 nginx"
@@ -249,76 +236,10 @@ render_nginx_conf() {
 # `ss -Hltn` 輸出（stdin）中監聽 80 或 443 的列（本機位址欄以 :80／:443 結尾）。
 listeners_80_443() { awk '$4 ~ /:(80|443)$/'; }
 
-# ── 離線套件包（打包與解包前的檢查）──────────────────────────────────────────
-
-# 檢查離線包可以安全解開：必須是 gzip tar、至少一個 .deb、每個條目名稱符合白名單
-# （扁平、只含 [A-Za-z0-9._+~%-]，%3a 是 epoch 的檔名編碼；因此 ./x.deb、sub/x.deb、
-# ../x.deb、/abs/x.deb、含空白者都被拒絕）、每個條目都是一般檔案（拒絕 symlink／hardlink／
-# 目錄／裝置）。不通過回非 0 並在 stderr 說明原因。
-check_offline_tar() {
-    local tar_file="$1" names types name t i=0 n
-    [ -f "$tar_file" ] || { echo "✗ 找不到離線包：$tar_file" >&2; return 1; }
-    gzip -t "$tar_file" 2>/dev/null || { echo "✗ 不是 gzip 壓縮檔：$tar_file" >&2; return 1; }
-    names="$(tar tzf "$tar_file" 2>/dev/null)" || { echo "✗ 無法讀取 tar 內容：$tar_file" >&2; return 1; }
-    types="$(tar tvzf "$tar_file" 2>/dev/null | cut -c1)" || { echo "✗ 無法讀取 tar 內容：$tar_file" >&2; return 1; }
-    [ -n "$names" ] || { echo "✗ 離線包內沒有任何 .deb：$tar_file" >&2; return 1; }
-    n="$(printf '%s\n' "$names" | wc -l)"
-    [ "$n" -eq "$(printf '%s\n' "$types" | wc -l)" ] || { echo "✗ tar 條目數不一致，拒絕解包：$tar_file" >&2; return 1; }
-    while IFS= read -r name; do
-        if ! [[ $name =~ ^[A-Za-z0-9._+~%-]+\.deb$ ]]; then
-            echo "✗ 離線包含不合規的條目（只接受扁平的 .deb 檔名）：$name" >&2
-            return 1
-        fi
-    done <<<"$names"
-    while IFS= read -r t; do
-        i=$((i + 1))
-        if [ "$t" != "-" ]; then
-            echo "✗ 離線包的條目不是一般檔案（類型 $t）：$(printf '%s\n' "$names" | sed -n "${i}p")" >&2
-            return 1
-        fi
-    done <<<"$types"
-}
-
-# 把 <來源目錄> 內的 *.deb 打成扁平的 tar.gz。先寫同目錄的暫存檔，驗證通過才 mv 過去：
-# 任何一步失敗都清掉暫存檔，既有的輸出檔原樣保留。
-pack_offline() { # pack_offline <來源目錄> <輸出 tar.gz>
-    local src="$1" out="$2" f tmp
-    local names=()
-    for f in "$src"/*.deb; do
-        [ -e "$f" ] && names+=("${f##*/}")
-    done
-    [ "${#names[@]}" -gt 0 ] || { echo "✗ $src 內沒有任何 .deb，不打包。" >&2; return 1; }
-    mkdir -p "$(dirname "$out")" || return 1
-    tmp="$(mktemp "$out.XXXXXX")" || return 1
-    if tar czf "$tmp" -C "$src" -- "${names[@]}" && check_offline_tar "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$out"; then
-        return 0
-    fi
-    rm -f "$tmp"
-    echo "✗ 打包失敗，未產生 $out（既有檔案保持原樣）。" >&2
-    return 1
-}
-
 # ── 動作 ─────────────────────────────────────────────────────────────
 
-# 檢查必備指令。不重用 require_machine 的額外指令參數：它只在 ubuntu 角色生效，
-# online／server 角色會忽略；本腳本兩種機器都要查額外指令（apt-get、curl、gpg、dpkg…），
-# 所以在此用 have_cmd 自查。（ISSUE-005 的 apt 來源／金鑰邏輯日後可能與此合併進 common.sh。）
-ngx_require_cmds() {
-    local c
-    for c in "$@"; do
-        have_cmd "$c" || die "缺少指令 $c。請在符合的機器上執行（見選單標示的【有網路的電腦】或【GitLab 伺服器】）。"
-    done
-}
-
-# 預設離線包路徑：sudo 下 $HOME 可能是 /root，所以有 SUDO_USER 時改用該使用者的家目錄。
-ngx_default_tarball() {
-    local home="$HOME" h=""
-    if [ -n "${SUDO_USER:-}" ] && have_cmd getent; then
-        h="$(getent passwd "$SUDO_USER" | cut -d: -f6)" || h=""
-        [ -z "$h" ] || home="$h"
-    fi
-    echo "$home/nginx-offline.tar.gz"
-}
+# 預設離線包路徑：家目錄見 sudo_home_dir（sudo 下 $HOME 可能是 /root）。
+ngx_default_tarball() { echo "$(sudo_home_dir)/nginx-offline.tar.gz"; }
 
 # 在暫存目錄 <stage> 內完成：匯入金鑰、加來源、下載含相依的 .deb、打包到 <tarball>。
 # 本函式在 `|| rc=$?` 條件中被呼叫，set -e 會失效，所以每個會失敗的步驟都明確檢查。
@@ -383,7 +304,7 @@ TXT
 ngx_build_offline() {
     local tarball stage rc=0 codename
     require_machine online
-    ngx_require_cmds apt-get apt-cache curl gpg tar
+    require_cmds apt-get apt-cache curl gpg tar
     codename="$(os_codename)"
     [ "$codename" = "noble" ] \
         || die "這個動作須在 Ubuntu 24.04（noble）上執行：來源行與相依套件都對應 noble，目前是「${codename:-未知}」。"
@@ -446,7 +367,7 @@ _ngx_install_in() { # _ngx_install_in <解包目錄>
 ngx_install_offline() {
     local tarball dir rc=0 f
     require_machine server
-    ngx_require_cmds dpkg tar systemctl
+    require_cmds dpkg tar systemctl
     require_root
     tarball="$(ask_param NGX_TARBALL "離線包路徑" "$(ngx_default_tarball)")"
     [ -f "$tarball" ] || die "找不到離線包：$tarball"
@@ -477,7 +398,7 @@ ngx_install_offline() {
 ngx_disable_builtin() {
     local user body line rc=0 sock
     require_machine server
-    ngx_require_cmds nginx
+    require_cmds nginx
     require_root
     user="$(detect_nginx_user "$(nginx_main_conf)")" \
         || die "讀不到 $(nginx_main_conf) 的 user 指令。請先用選單 3 安裝外部 Nginx。"
@@ -557,7 +478,7 @@ ngx_ports_ready() {
 ngx_configure_proxy() {
     local host scheme dir conf bak="" crt key ts body
     require_machine server
-    ngx_require_cmds nginx systemctl
+    require_cmds nginx systemctl
     require_root
     block_present "$(gitlab_rb_file)" "$NGX_EXT_BLOCK" \
         || die "尚未停用內建 Nginx（gitlab.rb 沒有 $NGX_EXT_BLOCK 區塊）。請先執行選單 4。"
@@ -610,7 +531,7 @@ ngx_configure_proxy() {
 ngx_verify() {
     local host scheme fails=0
     require_machine server
-    ngx_require_cmds systemctl curl
+    require_cmds systemctl curl
     host="$(env_get NGX_SERVER_NAME)"
     scheme="$(env_get NGX_SCHEME)"
     [ -n "$host" ] || die "還沒有設定 server_name。請先執行選單 6。"
@@ -634,7 +555,7 @@ ngx_verify() {
 ngx_revert_builtin() {
     local rc=0
     require_machine server
-    ngx_require_cmds systemctl
+    require_cmds systemctl
     require_root
     if ! block_present "$(gitlab_rb_file)" "$NGX_EXT_BLOCK"; then
         echo "gitlab.rb 沒有本腳本的外部 Nginx 區塊（$NGX_EXT_BLOCK），不需切換。"
