@@ -551,3 +551,49 @@ parse_dep_pkgs() {
     [ -n "$out" ] || return 1
     printf '%s\n' "$out"
 }
+
+# ── Docker 離線安裝（docker.sh、runner.sh 共用；PR-DKR-04）─────────────────────
+# 呼叫端常在 `|| rc=$?` 內使用，set -e 會失效，所以每個會失敗的步驟都明確檢查，不依賴 set -e。
+
+# 在 <stage> 下載 docker.io 與其全部相依的 .deb。解析失敗、解析不到任何套件、下載失敗皆回非 0。
+docker_download_debs() { # docker_download_debs <stage>
+    local stage="$1" deps pkgs=()
+    echo "── 下載 docker.io 與其相依套件 ──"
+    # 先收進變數再解析：行程替換會吞掉 apt-cache 的結束碼。
+    deps="$(apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts \
+        --no-breaks --no-replaces --no-enhances docker.io)" \
+        || { echo "✗ 解析 docker.io 的相依失敗。" >&2; return 1; }
+    mapfile -t pkgs < <(parse_dep_pkgs <<<"$deps")
+    [ "${#pkgs[@]}" -gt 0 ] || { echo "✗ 解析不到任何相依套件。" >&2; return 1; }
+    (cd "$stage" && apt-get download "${pkgs[@]}") || { echo "✗ apt-get download 失敗。" >&2; return 1; }
+}
+
+# 把離線包解到 <dir>：先複製成私有副本再檢查、解包，避免檢查通過後原檔被換掉（TOCTOU）。
+# 失敗回非 0，由呼叫端清除 <dir>。
+unpack_offline_tar() { # unpack_offline_tar <tar.gz> <dir>
+    local tarball="$1" dir="$2"
+    if ! cp "$tarball" "$dir/offline.tar.gz" || ! check_offline_tar "$dir/offline.tar.gz" \
+        || ! tar xzf "$dir/offline.tar.gz" -C "$dir" --no-same-owner; then
+        rm -f "$dir/offline.tar.gz"
+        return 1
+    fi
+    rm -f "$dir/offline.tar.gz"
+}
+
+# 列出 <dir> 內的 .deb、確認後 dpkg -i。回傳：0 成功；100 使用者取消（已印說明）；其他為 dpkg 的結束碼。
+install_debs_in() { # install_debs_in <dir>
+    local dir="$1" f rc=0
+    echo "將以 dpkg -i 安裝下列套件（相依套件若比系統現有的新，可能一併升級系統套件）："
+    for f in "$dir"/*.deb; do echo "  ${f##*/}"; done
+    if ! confirm "確定安裝？"; then
+        echo "已取消，未做任何變更。"
+        return 100
+    fi
+    dpkg -i "$dir"/*.deb || rc=$?
+    [ "$rc" -eq 0 ] || { echo "✗ dpkg -i 失敗（結束碼 $rc）；相依套件不足時請見選單「常見問題排查」。" >&2; return "$rc"; }
+}
+
+# 啟用並啟動 docker 服務；失敗只警告（套件已裝好），恆回 0。
+docker_enable_service() {
+    systemctl enable --now docker || echo "⚠ 無法啟動 docker 服務，請手動檢查。"
+}

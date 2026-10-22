@@ -3,7 +3,7 @@
 # 頂層只定義函式，不執行任何動作；`set -euo pipefail` 與 `cd` 都在 main 內，
 # 所以測試可以 source 本檔取得函式而不啟動選單。
 #
-# 後續票（安裝 Docker、遷移、逐站升級、說明與排查）在對應分區追加；本票先放佔位項目。
+# 後續票（遷移、逐站升級、說明與排查）在對應分區追加。
 
 _glc_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
@@ -88,8 +88,43 @@ docker_load_bundle() {
     echo "✓ 已載入 GitLab 映像包。"
 }
 
-# 佔位項目：內容由後續票填入，這裡不放假內容。
-docker_todo() { echo "（尚未實作：見 docs/issues/）"; }
+# 【有網路的電腦】打 Docker 離線包：docker.io 與其全部相依的 .deb（解析與下載是與 runner.sh 共用的
+# docker_download_debs）。檔名預設 docker-offline.tar.gz，與 runner.sh 的 runner-offline.tar.gz 分開，不互相覆蓋。
+docker_build_offline() {
+    local tarball stage rc=0
+    require_machine online
+    require_cmds apt-get apt-cache tar
+    tarball="$(ask_param GLC_DOCKER_TAR "Docker 離線包輸出路徑" "$(sudo_home_dir)/docker-offline.tar.gz" valid_local_path)" \
+        || die "離線包路徑不合法。"
+    stage="$(mktemp -d "${TMPDIR:-/tmp}/docker-offline.XXXXXX")" || die "建立暫存目錄失敗。"
+    # 在 `|| rc=$?` 內 set -e 會失效，所以每步都明確檢查。
+    if docker_download_debs "$stage" && pack_offline "$stage" "$tarball"; then
+        echo "✓ 已產生 Docker 離線包：$tarball（請以 scp 傳到【GitLab 伺服器】）"
+    else
+        rc=1
+    fi
+    rm -rf "$stage"
+    return "$rc"
+}
+
+# 【GitLab 伺服器】解開 Docker 離線包、dpkg -i 安裝並啟用 docker 服務。
+# 用 ubuntu 角色：安裝 Docker 發生在 GitLab 容器之前，不要求 /opt/gitlab。
+docker_install_offline() {
+    local tarball dir rc=0
+    require_machine ubuntu dpkg tar systemctl
+    require_root
+    tarball="$(ask_param GLC_DOCKER_TAR "Docker 離線包路徑" "$(sudo_home_dir)/docker-offline.tar.gz" valid_local_path)" \
+        || die "離線包路徑不合法。"
+    [ -f "$tarball" ] || die "找不到離線包：$tarball"
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/docker-install.XXXXXX")" || die "建立暫存目錄失敗。"
+    unpack_offline_tar "$tarball" "$dir" || { rm -rf "$dir"; die "離線包無法安全解開：$tarball"; }
+    install_debs_in "$dir" || rc=$?
+    rm -rf "$dir"
+    [ "$rc" -ne 100 ] || return 0 # 使用者取消：已說明，不算失敗
+    [ "$rc" -eq 0 ] || return "$rc"
+    docker_enable_service
+    echo "✓ 已安裝 Docker。下一步：載入 GitLab 映像包。"
+}
 
 # ── 選單 ─────────────────────────────────────────────────────────────────────
 
@@ -98,7 +133,8 @@ show_menu() {
 === GitLab 容器（Docker）===
   1) 打包 GitLab 映像包（docker save）  【有網路的電腦】
   2) 載入 GitLab 映像包（docker load）  【GitLab 伺服器】
-  3) 安裝 Docker（尚未實作）            【GitLab 伺服器】
+  3) 打包 Docker 離線包                【有網路的電腦】
+  4) 安裝 Docker（含啟用服務）          【GitLab 伺服器】
   q) 離開
 TXT
 }
@@ -107,7 +143,8 @@ dispatch() {
     case "$1" in
         1) docker_build_bundle ;;
         2) docker_load_bundle ;;
-        3) docker_todo ;;
+        3) docker_build_offline ;;
+        4) docker_install_offline ;;
         *) echo "✗ 無此選項：$1" >&2 ;;
     esac
 }
