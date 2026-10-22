@@ -51,7 +51,7 @@ valid_docker_version_list() { docker_normalize_versions "$1" >/dev/null 2>&1; }
 # ── 遷移用純函式（ISSUE-004）─────────────────────────────────────────────────
 
 # 三個掛載目錄（GLOSSARY），宿主機與容器路徑相同；逐行輸出 `-v` 與 `src:dst`。
-GLC_MOUNT_DIRS="/etc/gitlab /var/opt/gitlab /var/log/gitlab"
+GLC_MOUNT_DIRS="${GLC_MOUNT_DIRS:-/etc/gitlab /var/opt/gitlab /var/log/gitlab}"
 docker_mount_args() {
     local d
     for d in $GLC_MOUNT_DIRS; do printf '%s\n%s\n' "-v" "$d:$d"; done
@@ -280,7 +280,28 @@ docker_verify() {
     docker exec gitlab gitlab-rake gitlab:check || die "驗證失敗：gitlab:check 未通過。"
     code="$(curl -ksI --max-time 30 -o /dev/null -w '%{http_code}' "$url")" || code="000"
     http_status_ok "$code" || die "驗證失敗：curl -kI $url 回應 $code（需 2xx／3xx）。"
+    env_set GLC_VERIFIED_AT "$(glc_now_epoch)" # 驗證通過才記下時間，供 purge 判斷「剛通過」
     echo "✓ gitlab:check 通過，$url 回應 $code。"
+}
+
+
+# ── purge 用純函式（ISSUE-006）───────────────────────────────────────────────
+
+# 驗證「剛通過」：戳記（epoch 秒）存在、是數字、不在未來、距現在不超過時限才回 0。
+docker_verify_fresh() { # docker_verify_fresh <戳記> <現在> <最長秒數>
+    [[ ${1:-} =~ ^[0-9]+$ ]] || return 1
+    [ "$1" -le "$2" ] && [ $(($2 - $1)) -le "$3" ]
+}
+
+# purge 前後的掛載目錄清單（每行一個項目）比對：輸出 purge 前有、purge 後沒有的項目。
+docker_dirs_lost() { # docker_dirs_lost <前清單> <後清單>
+    comm -23 <(printf '%s\n' "$1" | sed '/^$/d' | sort -u) <(printf '%s\n' "$2" | sed '/^$/d' | sort -u)
+}
+
+# 掛載目錄仍在的判斷：purge 前清單不能是空的（空清單無從比較，不能當作安全），且沒有任何項目消失才回 0。
+docker_dirs_lost_check() { # docker_dirs_lost_check <前清單> <後清單>
+    [ -n "$(printf '%s' "$1" | sed '/^$/d')" ] || return 1
+    [ -z "$(docker_dirs_lost "$1" "$2")" ]
 }
 
 
@@ -393,6 +414,84 @@ docker_migrate() {
 }
 
 
+
+# ── purge 舊 deb 套件（ISSUE-006）────────────────────────────────────────────
+
+# purge 的第二道確認字串（不是密碼，不需隱藏）；驗證戳記有效秒數預設 1 小時（GLC_VERIFY_MAX_AGE 可調）。
+GLC_PURGE_PHRASE="purge-old-deb"
+glc_now_epoch() { date +%s; }
+
+# 三個掛載目錄內（兩層深）的項目，一行一個；purge 前後各取一次比對。
+docker_dir_listing() {
+    local d
+    for d in $GLC_MOUNT_DIRS; do
+        [ -d "$d" ] && find "$d" -mindepth 1 -maxdepth 2 2>/dev/null
+    done
+    return 0
+}
+
+# PR-DKR-18 閘門：ISSUE-004 的驗證剛通過（戳記未逾時），且容器此刻仍是 healthy；否則拒絕並說明。
+docker_purge_precheck() {
+    local stamp out
+    stamp="$(env_get GLC_VERIFIED_AT)"
+    docker_verify_fresh "$stamp" "$(glc_now_epoch)" "${GLC_VERIFY_MAX_AGE:-3600}" \
+        || die "拒絕移除：找不到「剛通過」的遷移驗證（沒有紀錄或已逾時）。請先重新執行選單 5 的驗證流程，確認 gitlab:check 與 curl -kI 通過後再來。"
+    out="$(docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' gitlab 2>/dev/null)" || out=""
+    [ "${out#* }" = healthy ] \
+        || die "拒絕移除：容器 gitlab 目前不是 healthy（${out:-讀不到狀態}）。請先用 docker logs gitlab 排除。"
+}
+
+# purge 失敗時讓容器回到原樣：還原重啟政策；原本在跑而現在沒跑就啟動它。盡力而為，不再 die。
+docker_restore_container() { # docker_restore_container <重啟政策> <原狀態>
+    echo "嘗試讓容器 gitlab 回到 purge 前的狀態（重啟政策 $1、狀態 $2）..." >&2
+    docker update --restart "$1" gitlab >&2 || echo "⚠ 還原重啟政策失敗，請手動檢查。" >&2
+    if [ "$2" = running ] && [ "$(docker inspect -f '{{.State.Status}}' gitlab 2>/dev/null)" != running ]; then
+        docker start gitlab >&2 || echo "⚠ 啟動容器失敗，請手動檢查。" >&2
+    fi
+}
+
+# 【GitLab 伺服器】驗證通過後 purge 舊 deb 套件。不可逆：之後只剩機外備份。
+# 順序為「保持容器運行 → apt purge → 比對掛載目錄 → 重跑驗證」，直接 purge 而不是先停容器。
+# 未驗證：真實 `apt purge gitlab-ce` 的 prerm／postrm 是否會動到容器正在用的掛載目錄（spec Open question 2）
+# 尚未在 WSL／VM 實測，這個排法是預設假設，不是實測結論；測試只用假 apt。比對與還原就是為這個未知而設。
+# 絕不呼叫 gitlab-ctl cleanse（會刪資料目錄）。apt 回非 0 不直接判失敗，以掛載目錄與容器驗證為準。
+docker_purge_deb() {
+    local ans="" st policy state before after lost rc=0
+    require_machine ubuntu docker
+    require_root
+    docker_deb_version >/dev/null 2>&1 || { echo "找不到 deb 安裝的 gitlab-ce，沒有東西可移除。"; return 0; }
+    docker_purge_precheck
+    echo "⚠ 即將 apt purge gitlab-ce。這一步不可逆：舊 deb 版從此不存在，之後只剩機外備份可以救。"
+    echo "  掛載目錄（$GLC_MOUNT_DIRS）預期不受影響，purge 後會逐項比對並重跑驗證。"
+    confirm "確定移除舊 deb 套件？" || { echo "已取消，未做任何變更。"; return 0; }
+    read -r -p "再次確認：輸入 $GLC_PURGE_PHRASE 繼續：" ans || true
+    [ "$ans" = "$GLC_PURGE_PHRASE" ] || { echo "未輸入確認字串，已取消，未做任何變更。"; return 0; }
+
+    st="$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}} {{.State.Status}}' gitlab)" || die "讀不到容器 gitlab 的狀態，未做任何變更。"
+    policy="${st%% *}"
+    state="${st#* }"
+    before="$(docker_dir_listing)"
+    env_set GLC_VERIFIED_AT "" # purge 後必須重新驗證，不沿用 purge 前的戳記
+    echo "══ apt purge gitlab-ce ══"
+    apt purge -y gitlab-ce || rc=$?
+    [ "$rc" -eq 0 ] || echo "⚠ apt purge 回傳 $rc（上面是實際輸出）；以掛載目錄與容器驗證為準，繼續檢查。" >&2
+
+    after="$(docker_dir_listing)"
+    if ! docker_dirs_lost_check "$before" "$after"; then
+        lost="$(docker_dirs_lost "$before" "$after")"
+        echo "✗ purge 後掛載目錄有項目消失（或 purge 前就是空的）：" >&2
+        printf '%s\n' "${lost:-（purge 前清單為空，無法比對）}" | sed 's/^/  /' >&2
+        docker_restore_container "$policy" "$state"
+        die "掛載目錄內容消失，遷移不算完成，已停止。請用機外備份還原。"
+    fi
+    echo "✓ 掛載目錄內容仍在。"
+    if ! ( docker_wait_healthy && docker_verify ); then
+        docker_restore_container "$policy" "$state"
+        die "purge 後重跑驗證失敗（gitlab:check／curl 未通過），遷移不算完成。請看上面的輸出與 docker logs gitlab。"
+    fi
+    echo "✓ 遷移完成：舊 deb 套件已移除，GitLab 由容器服務，掛載目錄完好。"
+}
+
 # ── 選單 ─────────────────────────────────────────────────────────────────────
 
 show_menu() {
@@ -403,6 +502,7 @@ show_menu() {
   3) 打包 Docker 離線包                【有網路的電腦】
   4) 安裝 Docker（含啟用服務）          【GitLab 伺服器】
   5) 遷移到 Docker（沿用現有資料）      【GitLab 伺服器】
+  6) 移除舊 deb 套件（不可逆）          【GitLab 伺服器】
   q) 離開
 TXT
 }
@@ -414,6 +514,7 @@ dispatch() {
         3) docker_build_offline ;;
         4) docker_install_offline ;;
         5) docker_migrate ;;
+        6) docker_purge_deb ;;
         *) echo "✗ 無此選項：$1" >&2 ;;
     esac
 }
