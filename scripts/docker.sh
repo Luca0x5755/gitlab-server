@@ -3,7 +3,7 @@
 # 頂層只定義函式，不執行任何動作；`set -euo pipefail` 與 `cd` 都在 main 內，
 # 所以測試可以 source 本檔取得函式而不啟動選單。
 #
-# 遷移（deb → GitLab 容器）見 docker_migrate；後續票（purge、逐站升級、說明與排查）在對應分區追加。
+# 遷移（deb → GitLab 容器）見 docker_migrate、逐站升級見 docker_upgrade；後續票（說明與排查）在對應分區追加。
 
 _glc_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
@@ -305,6 +305,113 @@ docker_dirs_lost_check() { # docker_dirs_lost_check <前清單> <後清單>
 }
 
 
+# ── 逐站升級用純函式（ISSUE-007）─────────────────────────────────────────────
+
+# 決定要升哪些站。參數：目前容器的 tag、已載入的 tag 清單（一行一個）。
+# stdout：數值上比目前版本高的 tag，由小到大、去重（18.9 < 18.10）。
+# stderr：略過者（不高於目前版本）逐行說明。任一版本非法回非 0 且不輸出：寧可中止也不要猜。
+docker_upgrade_plan() { # docker_upgrade_plan <目前 tag> <已載入 tag 清單>
+    local cur="$1" sorted t keep=""
+    valid_gitlab_version "$cur" || { echo "✗ 目前版本格式不符：$cur" >&2; return 1; }
+    # 排序與去重分兩步：sort_versions 的失敗不能被管線尾端的 awk 蓋掉。
+    sorted="$(printf '%s\n' "$2" | sed '/^$/d' | sort_versions asc)" || return 1
+    sorted="$(printf '%s\n' "$sorted" | awk '!seen[$0]++')"
+    while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        if [ "$(version_cmp "$t" "$cur")" = 1 ]; then
+            keep+="$t"$'\n'
+        else
+            echo "略過 $t：不高於目前版本 $cur。" >&2
+        fi
+    done <<<"$sorted"
+    printf '%s' "$keep"
+}
+
+# 由映像參照 gitlab/gitlab-ce:<tag> 取出 tag；不是 gitlab-ce 映像或 tag 不合法回非 0。
+docker_tag_from_image() { # docker_tag_from_image <映像參照>
+    local tag="${1#gitlab/gitlab-ce:}"
+    [ "$tag" != "$1" ] && valid_gitlab_version "$tag" || return 1
+    echo "$tag"
+}
+
+# 該站是否為 18.11（啟動時會自動升級 PostgreSQL，PR-DKR-23）。
+docker_station_needs_pg_warning() { # docker_station_needs_pg_warning <站 tag>
+    [[ $1 =~ ^18\.11\.[0-9]+-ce\.[0-9]+$ ]]
+}
+
+# 由 `df -Pk` 輸出取剩餘空間（人看的大小）；讀不到回非 0。
+docker_free_space_line() { # docker_free_space_line <df -Pk 輸出>
+    local kb
+    kb="$(printf '%s\n' "$1" | awk 'NR == 2 && $4 ~ /^[0-9]+$/ { print $4 }')"
+    [ -n "$kb" ] || return 1
+    format_bytes "$((kb * 1024))"
+}
+
+# ── 逐站升級動作（ISSUE-007）─────────────────────────────────────────────────
+# 未驗證：以下流程只用假 docker 測過，沒有在真實環境升級過（真實 docker 升級與 18.11 的
+# PostgreSQL 自動升級無法無人值守執行）。部署前須在 WSL／VM 以實際映像包走一遍。
+
+# 背景遷移查詢式（容器內 gitlab-rails runner）；與 upgrade.sh 的 deb 版相同。
+GLC_QUEUED_EXPR='puts Gitlab::Database::BackgroundMigration::BatchedMigration.queued.count'
+
+# 目前 gitlab 容器的版本 tag；沒有容器或不是 gitlab-ce 映像回非 0。獨立成函式讓測試能換掉。
+docker_current_tag() {
+    local img
+    img="$(docker inspect -f '{{.Config.Image}}' gitlab 2>/dev/null)" || return 1
+    docker_tag_from_image "$img"
+}
+
+# 已載入的 gitlab/gitlab-ce tag（一行一個，只留合法版本）。
+docker_loaded_tags() {
+    local t
+    for t in $(docker images gitlab/gitlab-ce --format '{{.Tag}}'); do
+        valid_gitlab_version "$t" && echo "$t"
+    done
+    return 0
+}
+
+# PR-DKR-24：輪詢容器內背景遷移佇列直到 0。間隔與次數沿用 upgrade.sh 的 UPG_POLL_INTERVAL（預設 30 秒）、
+# UPG_POLL_MAX（預設 120 次）。讀不到數字不當作 0。逾時回非 0 並指向 sidekiq 日誌。
+docker_upgrade_wait_migrations() {
+    local interval="${UPG_POLL_INTERVAL:-30}" max="${UPG_POLL_MAX:-120}" i out n="" last=""
+    echo "等待背景遷移歸零（queued.count 須為 0）..."
+    for ((i = 1; i <= max; i++)); do
+        out="$(docker exec gitlab gitlab-rails runner -e production "$GLC_QUEUED_EXPR" 2>&1)" || true
+        if n="$(parse_queued_count <<<"$out")"; then
+            last="$n"
+            if [ "$n" = 0 ]; then
+                echo "  背景遷移已歸零。"
+                return 0
+            fi
+            echo "  第 $i 次：仍有 $n 個背景遷移在佇列中..."
+        else
+            last="（無法讀取）"
+            echo "  第 $i 次：讀不到佇列數量（服務可能還沒起來）..."
+        fi
+        [ "$i" -ge "$max" ] || sleep "$interval"
+    done
+    echo "✗ 等了 $max 次仍未歸零（最後一次：$last）。已停止，未升級下一站。" >&2
+    echo "  請看 sidekiq 日誌：docker exec gitlab gitlab-ctl tail sidekiq（宿主機 /var/log/gitlab/sidekiq/current）；" >&2
+    echo "  歸零後重跑選單 7 即可接續（以目前容器版本為準）。" >&2
+    return 1
+}
+
+# 升一站（PR-DKR-21／22／24）：備份 → 停止並移除舊容器（不動掛載目錄）→ 以新 tag 與同一組參數重建
+# → 等健康 → 等背景遷移歸零。任一步失敗即 die。備份失敗時舊容器完全沒動。
+docker_upgrade_station() { # docker_upgrade_station <站 tag>
+    local tag="$1" ref
+    ref="$(docker_image_ref "$tag")" || die "站版本不合法：$tag"
+    echo "══ 升級到 $tag ══"
+    docker_run_backup || die "升級前備份失敗（結束碼 $?），已中止，容器 gitlab 未被更動。請先排除備份問題。"
+    # 停止逾時預設 300 秒（GLC_STOP_TIMEOUT 可調）：預設 10 秒可能在資料庫關閉前就強殺。
+    docker stop -t "${GLC_STOP_TIMEOUT:-300}" gitlab || die "停止容器 gitlab 失敗。"
+    docker rm gitlab || die "移除舊容器 gitlab 失敗（掛載目錄未動）。"
+    docker_start_container "$ref"
+    docker_wait_healthy
+    docker_upgrade_wait_migrations || die "背景遷移未歸零，已停止在 $tag。"
+    echo "✓ 已升級到 $tag。"
+}
+
 # ── 動作 ─────────────────────────────────────────────────────────────────────
 
 # 【有網路的電腦】依版本清單逐一 docker pull，再 docker save 成單一 GitLab 映像包。
@@ -414,6 +521,49 @@ docker_migrate() {
 }
 
 
+# 確認目前容器健康、背景遷移已歸零，再跑最終檢查並顯示版本（PR-DKR-24／25）。
+# 重跑時也走這裡：上次可能中斷在某站的「等健康／等背景遷移」，那一站的容器已是新版本，
+# 不先確認就進下一站，會在背景遷移未完成時繼續升級。
+docker_upgrade_finish() {
+    docker_wait_healthy
+    docker_upgrade_wait_migrations || die "目前容器的背景遷移未歸零，已停止。"
+    echo "══ 最終檢查 ══"
+    docker exec gitlab gitlab-rake gitlab:check SANITIZE=true || die "gitlab:check 未通過，請看上面的輸出。"
+    echo "✓ 升級完成：目前版本 $(docker_current_tag || echo "（讀不到）")。"
+}
+
+# 【GitLab 伺服器】逐站升級 GitLab 容器（PR-DKR-20／23／25）。以目前容器版本為準，只升數值上更高的已載入映像；
+# 中斷後重跑自然略過已完成的站。腳本不猜停靠站：已載入哪些版本由映像包決定（人查 Upgrade Path Tool）。
+# 用 ubuntu 角色：舊 deb 可能已 purge，/opt/gitlab 不在。實測狀態見上方「未驗證」註記。
+docker_upgrade() {
+    local cur plan tag n
+    require_machine ubuntu docker
+    require_root
+    cur="$(docker_current_tag)" || die "讀不到容器 gitlab 的版本（容器不存在或不是 gitlab/gitlab-ce 映像）。請先完成遷移。"
+    plan="$(docker_upgrade_plan "$cur" "$(docker_loaded_tags)")" || die "無法決定升級順序（版本字串不合法）。"
+    if [ -z "$plan" ]; then
+        echo "沒有比目前版本（$cur）更高的已載入映像，不需要升級；僅確認背景遷移與最終檢查。要升級請先載入映像包（選單 2）。"
+        docker_upgrade_finish
+        return 0
+    fi
+    echo "目前版本：$cur。將依序升級："
+    n=0
+    for tag in $plan; do n=$((n + 1)); echo "  $n. $tag"; done
+    echo "每一站都會先備份、再停止並重建容器、等背景遷移歸零；GitLab 在每一站會中斷數分鐘。"
+    confirm "確定開始逐站升級？" || { echo "已取消，未做任何變更。"; return 0; }
+    # 重跑時目前容器可能是上次中斷的那一站：它的背景遷移要先歸零才能進下一站（PR-DKR-24）。
+    docker_upgrade_wait_migrations || die "目前容器的背景遷移未歸零，未升級下一站。"
+    for tag in $plan; do
+        if docker_station_needs_pg_warning "$tag"; then
+            echo "⚠ 即將進入 $tag：容器啟動時會自動升級 PostgreSQL 到 17.7，耗時隨資料庫大小增加。"
+            echo "  $(glc_data_dir) 所在磁碟剩餘空間：$(docker_free_space_line "$(df -Pk "$(glc_data_dir)")" || echo "（讀不到）")"
+            confirm "了解並繼續？" || { echo "已取消，停在 $(docker_current_tag || echo "$cur")。"; return 0; }
+        fi
+        docker_upgrade_station "$tag"
+    done
+    docker_upgrade_finish
+}
+
 
 # ── purge 舊 deb 套件（ISSUE-006）────────────────────────────────────────────
 
@@ -503,6 +653,7 @@ show_menu() {
   4) 安裝 Docker（含啟用服務）          【GitLab 伺服器】
   5) 遷移到 Docker（沿用現有資料）      【GitLab 伺服器】
   6) 移除舊 deb 套件（不可逆）          【GitLab 伺服器】
+  7) 逐站升級 GitLab 容器              【GitLab 伺服器】
   q) 離開
 TXT
 }
@@ -515,6 +666,7 @@ dispatch() {
         4) docker_install_offline ;;
         5) docker_migrate ;;
         6) docker_purge_deb ;;
+        7) docker_upgrade ;;
         *) echo "✗ 無此選項：$1" >&2 ;;
     esac
 }

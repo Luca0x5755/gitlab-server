@@ -203,6 +203,20 @@ menu_loop() {
     done
 }
 
+
+# 背景遷移輪詢共用（upgrade.sh 與 docker.sh）：
+# 取出 `gitlab-rails runner` 輸出（stdin）中最後一個純數字行（前面可能有警告訊息）。
+# 找不到回非 0。
+parse_queued_count() {
+    local line n=""
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        [[ $line =~ ^[0-9]+$ ]] && n="$line"
+    done
+    [ -n "$n" ] || return 1
+    printf '%s\n' "$n"
+}
+
 # ── 版本字串（純函式；ISSUE-007／008 直接使用，勿另行定義）──────────────────────
 
 # 版本轉成可字串比較的鍵：主.次.修[-ce.N]，各段補零到 10 位；無 -ce 後綴視同 -ce.0。
