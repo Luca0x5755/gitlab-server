@@ -18,3 +18,8 @@
 - 2026-10-21 Runner 版本與 GitLab 版本不一致時警告並詢問，不硬擋；token 由使用者在後台建立後隱藏輸入貼上，不用管理員 PAT 自動建立 — 不多持有一個高權限秘密。
 - 2026-10-21 job 容器以 `clone_url` 指向區網 IP 連回 GitLab（不用 host 網路），HTTPS 時複製 CA 到 `/etc/gitlab-runner/certs/` — 容器內的 127.0.0.1 是容器自己；離線 image 預設 alpine:3.20、ubuntu:24.04、node:22、python:3.13、docker:27-cli，可由 `ask_param` 改。
 - 2026-10-21 POC 的 `external_url` 為自簽憑證 HTTPS：Runner 以該憑證本身當 CA（`tls-ca-file`），註冊前用 `openssl` 檢查憑證 SAN 涵蓋 `clone_url` 的主機（IP 或網域），不涵蓋就中止並說明需重簽 — 憑證只有 CN 或缺該 IP 時，job 的 `git clone` 會憑證驗證失敗。
+- 2026-10-22 Git SSH 埠用 2222，宿主機 sshd 的 22 不動 — 無人使用 SSH clone；沿用宿主機 sshd 搭 shim 轉發進容器的做法非官方支援，且改 sshd 或停用 sshd 會讓 `scp`／遠端管理失效。
+- 2026-10-22 容器以 `docker.sh` 選單腳本用 `docker run` 啟動，不用 compose — 離線時少一個相依；每站只需換 tag 重建容器。
+- 2026-10-22 Docker 的離線安裝從 `runner.sh` 抽成共用函式，`docker.sh` 與 `runner.sh` 共用 — 避免兩份 `docker.io` 相依解析邏輯。
+- 2026-10-22 Runner 在遷移與升級到 19.5.1 穩定後才以 `runner.sh` 安裝（宿主機 deb、Docker executor、instance runner）— 尚未建置，沿用既有設計；順序放後面以免升級期間混入變因。
+- 2026-10-22 機外備份由使用者手動複製，腳本只列檔案與大小並要求輸入確認字串 — 內網機的目的地因環境而異，腳本不猜。
