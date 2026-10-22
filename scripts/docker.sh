@@ -3,7 +3,7 @@
 # 頂層只定義函式，不執行任何動作；`set -euo pipefail` 與 `cd` 都在 main 內，
 # 所以測試可以 source 本檔取得函式而不啟動選單。
 #
-# 遷移（deb → GitLab 容器）見 docker_migrate、逐站升級見 docker_upgrade；後續票（說明與排查）在對應分區追加。
+# 遷移（deb → GitLab 容器）見 docker_migrate、逐站升級見 docker_upgrade；說明與排查見選單 8、9。
 
 _glc_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
@@ -131,7 +131,7 @@ docker_preflight() { # docker_preflight <tag>
     have_cmd docker || die "前置檢查失敗：Docker 未安裝。請先執行選單 4 安裝 Docker。"
     deb="$(docker_deb_version)" || die "前置檢查失敗：讀不到 deb 安裝的 gitlab-ce 版本。這個動作只適用 deb 安裝的 GitLab。"
     docker_version_matches "$deb" "$tag" \
-        || die "前置檢查失敗：deb 版本（$deb）與要啟動的映像 tag（$tag）不同。版本必須一致才能沿用資料目錄。"
+        || die "前置檢查失敗：deb 版本（$deb）與要啟動的映像 tag（$tag）不同。版本必須一致才能沿用掛載目錄。"
     docker image inspect "$ref" >/dev/null 2>&1 \
         || die "前置檢查失敗：映像 $ref 尚未載入。請先執行選單 2 載入 GitLab 映像包。"
     [ -z "$(docker ps -a --filter name=^gitlab$ --format '{{.Names}}')" ] \
@@ -642,6 +642,88 @@ docker_purge_deb() {
     echo "✓ 遷移完成：舊 deb 套件已移除，GitLab 由容器服務，掛載目錄完好。"
 }
 
+# ── 說明與排查 ───────────────────────────────────────────────────────────────
+# 只描述已實作的行為。docker、apt 的真實動作都只用假指令測過，尚未在實機試跑；文字內如實標明。
+
+show_help() {
+    cat <<'TXT'
+【說明】GitLab 容器（Docker）
+本腳本把 deb 安裝的 GitLab 改成 GitLab 容器，並逐站升級；在【GitLab 伺服器】上以 root（sudo）執行。
+注意：遷移、purge、逐站升級與容器備份都尚未在實機試跑（只用假 docker／apt 測過），
+首次使用請先在 WSL／VM 或資料副本上走一遍。
+
+整體順序（選單項目）：
+  1（【有網路的電腦】）打包 GitLab 映像包，內含升級路徑上每一站的映像。
+  3（【有網路的電腦】）打包 Docker 離線包。
+  scp 把兩個包傳到【GitLab 伺服器】。
+  4 安裝 Docker；2 載入 GitLab 映像包。
+  5 遷移：備份並確認已複製到機外 → 改 gitlab.rb（移除外部 Nginx 管理區塊、設定 Git SSH 埠）→
+    停 deb 版 → 以掛載目錄啟動 GitLab 容器 → 等 healthy → gitlab:check 與 curl 驗證。
+    映像版本須與 deb 版本相同（預設 18.10.3）；這一步 deb 套件還在。
+  6 移除舊 deb 套件：只有剛通過驗證才允許；不可逆，之後只剩機外備份。
+  7 逐站升級：預設路徑 18.10.3 → 18.11.13 → 19.2.9 → 19.5.1。
+
+為什麼一定要經過 18.11：
+  GitLab 不可任意跨版本升級，停靠站依 Upgrade Path Tool
+  （https://gitlab-com.gitlab.io/support/toolbox/upgrade-path/）；18.11 是必停版本，
+  18.11 起會自動把 PostgreSQL 升到 17.7，19.0 起 PostgreSQL 17 是最低版本，
+  所以不能 18.10.3 直接到 19.2。本腳本不猜停靠站：映像包裡有什麼，就升什麼（只升比目前高的）。
+  進入 18.11 前會警告並顯示資料磁碟剩餘空間；該站啟動時間隨資料庫大小增加。
+
+逐站升級（選單 7）：
+  每一站：備份 → docker stop → docker rm（掛載目錄不動）→ 以新版映像重建容器 → 等 healthy →
+  等背景遷移歸零。中斷後重跑選單 7：以目前容器版本為準，先確認背景遷移歸零再升下一站。
+
+Git SSH 埠：
+  GitLab 容器把 Git SSH 埠發佈在 2222（遷移時寫入 gitlab.rb），clone 要寫成
+  git clone ssh://git@<主機>:2222/<群組>/<專案>.git
+  宿主機 sshd 的 22 不動，仍供管理員 ssh／scp。
+
+HTTPS：
+  容器使用內建 Nginx，直接發佈 80／443，沿用 /etc/gitlab/ssl 的自簽憑證；
+  nginx.sh 的外部 Nginx 流程不適用於 GitLab 容器。install.sh、nginx.sh、upgrade.sh 僅適用 deb 安裝。
+
+備份：
+  backup_auto.sh 偵測到名為 gitlab 的容器在跑時，改以 docker exec 在容器內備份，
+  產物仍在宿主機的 /var/opt/gitlab/backups 與 /etc/gitlab/config_backup。容器模式的還原不在本腳本範圍。
+
+Docker 發佈的埠會直接寫 iptables，ufw 規則擋不住 80／443／2222；要限制來源網段請另行處理。
+TXT
+}
+
+show_troubleshooting() {
+    cat <<'TXT'
+【常見問題排查】（以下尚未在實機試跑，指令請依實際輸出判斷）
+  權限錯誤（容器日誌出現 Permission denied、檔案擁有者不對）：
+    1. 以暫時容器重新對齊 UID（掛三個掛載目錄）：
+       docker run --rm -v /etc/gitlab:/etc/gitlab -v /var/opt/gitlab:/var/opt/gitlab          -v /var/log/gitlab:/var/log/gitlab gitlab/gitlab-ce:<目前版本>-ce.0 update-permissions
+    2. 再 docker restart gitlab。
+    不要手動 chown 成 root:root。
+  容器起不來或一直重啟：
+    - docker logs gitlab 看原因（docker logs -f gitlab 持續追蹤）。
+    - 日誌出現 stat: missing operand：通常是 /var/opt/gitlab/git-data/repositories 不存在或是壞掉的
+      symlink；修好目錄後 docker restart gitlab。
+    - 磁碟空間不足：df -h /var/opt/gitlab 看掛載目錄所在磁碟；18.11 的 PostgreSQL 升級需要額外空間。
+    - 80、443、2222 被占用：ss -ltn 查出占用者（deb 版沒停乾淨最常見）。
+    - docker ps -a 看狀態；docker inspect -f '{{.State.Health.Status}}' gitlab 看是否 healthy。
+      啟動後 healthy 要數分鐘，18.11 因 PostgreSQL 升級更久。
+  前置檢查失敗：照訊息處理。deb 版本與映像版本必須相同；映像未載入先執行選單 2；已有名為 gitlab 的容器不會被覆蓋。
+  背景遷移一直不是 0（逾時）：
+    - docker exec gitlab gitlab-ctl status sidekiq，並看 docker exec gitlab gitlab-ctl tail sidekiq
+      （宿主機檔案在 /var/log/gitlab/sidekiq/current）。
+    - 大型資料庫要等很久；歸零後重跑選單 7 會接續。不要在遷移未歸零時升下一站。
+  gitlab:check 有 FAILED：docker exec gitlab gitlab-rake gitlab:check SANITIZE=true，照輸出修正；
+    剛重啟後幾分鐘內的暫時失敗可稍後再跑。
+  備份失敗：本流程不會在沒有備份時動 deb 版或升級；先排除備份問題（磁碟空間、容器狀態）。
+  purge（選單 6）：
+    - 不可逆：舊 deb 套件移除後不能回頭，只剩機外備份。必須先有「剛通過」的驗證（逾時請重跑選單 5），
+      並輸入確認字串。
+    - purge 後若掛載目錄項目消失，或重跑驗證失敗，腳本會停止並嘗試還原容器；請用機外備份還原。
+    - apt purge 對運行中容器的影響尚未在實機試跑（spec Open question 2 仍未解），
+      所以才有 purge 前後比對與重新驗證；絕不使用 gitlab-ctl cleanse。
+TXT
+}
+
 # ── 選單 ─────────────────────────────────────────────────────────────────────
 
 show_menu() {
@@ -654,6 +736,8 @@ show_menu() {
   5) 遷移到 Docker（沿用現有資料）      【GitLab 伺服器】
   6) 移除舊 deb 套件（不可逆）          【GitLab 伺服器】
   7) 逐站升級 GitLab 容器              【GitLab 伺服器】
+  8) 說明
+  9) 常見問題排查
   q) 離開
 TXT
 }
@@ -667,6 +751,8 @@ dispatch() {
         5) docker_migrate ;;
         6) docker_purge_deb ;;
         7) docker_upgrade ;;
+        8) show_help ;;
+        9) show_troubleshooting ;;
         *) echo "✗ 無此選項：$1" >&2 ;;
     esac
 }
