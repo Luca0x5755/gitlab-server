@@ -79,6 +79,36 @@ setup_sandbox() { # setup_sandbox <名稱>
     rm -f "$OPS_ENV_FILE"
     make_stub "$SB/bin" gitlab-backup 'if [ "$1" = restore ]; then exit "${STUB_RESTORE_RC:-0}"; fi; [ "${STUB_BACKUP_RC:-0}" -eq 0 ] || exit "$STUB_BACKUP_RC"; : >"'"$SB"'/data/1776235587_2026_04_15_18.7.6_gitlab_backup.tar"'
     make_stub "$SB/bin" gitlab-ctl 'if [ "$1" = reconfigure ]; then cp "$GITLAB_RB" "$SNAP"; exit "${STUB_RECONF_RC:-0}"; fi; if [ "$1" = backup-etc ]; then [ "${STUB_ETC_RC:-0}" -eq 0 ] || exit "$STUB_ETC_RC"; : >"'"$SB"'/cfg/gitlab_config_1776235587_2026_04_15.tar"; fi'
+    # docker 假指令（手寫，只有 exec 才記錄到 STUB_LOG，探測不記錄）：
+    # 預設回報「沒有容器」，所以不受開發機上真實 docker 影響；STUB_DOCKER_RUNNING 切換情境：
+    #   1 名為 gitlab 的容器執行中；stopped 已停止；runner 只有名為 gitlab-runner 的容器；down docker 本身失敗。
+    export STUB_SB="$SB"
+    cat >"$SB/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+    inspect)
+        name="${*: -1}"
+        case "${STUB_DOCKER_RUNNING:-}" in
+            1) [ "$name" = gitlab ] && { echo true; exit 0; } ;;
+            stopped) [ "$name" = gitlab ] && { echo false; exit 0; } ;;
+            runner) [ "$name" = gitlab-runner ] && { echo true; exit 0; } ;;
+        esac
+        exit 1 ;;
+    exec)
+        echo "docker $*" >>"${STUB_LOG:-/dev/null}"
+        case "$3 $4" in
+            "gitlab-backup create")
+                [ "${STUB_BACKUP_RC:-0}" -eq 0 ] || exit "$STUB_BACKUP_RC"
+                : >"$STUB_SB/data/1776235587_2026_04_15_18.7.6_gitlab_backup.tar" ;;
+            "gitlab-ctl backup-etc")
+                [ "${STUB_ETC_RC:-0}" -eq 0 ] || exit "$STUB_ETC_RC"
+                : >"$STUB_SB/cfg/gitlab_config_1776235587_2026_04_15.tar" ;;
+        esac
+        exit 0 ;;
+esac
+exit 1
+STUB
+    chmod +x "$SB/bin/docker"
     make_stub "$SB/bin" apt 'exit 0'
     make_stub "$SB/bin" dpkg-query 'if [ -n "${STUB_NOPKG:-}" ]; then exit 1; fi; echo "${STUB_PKG_VERSION:-18.7.6-ce.0}"'
     make_stub "$SB/bin" chown 'exit "${STUB_CHOWN_RC:-0}"'
@@ -149,6 +179,70 @@ rmdir "$SB/opt"
 out="$(env_run '' "$auto")"
 assert_eq "0" "$(wc -l <"$STUB_LOG" | tr -d ' ')" "沒裝 GitLab：不做任何備份"
 assert_contains "$out" "【GitLab 伺服器】" "沒裝 GitLab：指向【GitLab 伺服器】"
+
+# ── 容器模式（PR-DKR-40、41、42）──
+# 純函式：模式判斷與 docker exec 組裝（沙箱的假 docker）
+setup_sandbox mode
+mode_of() { ( PATH="$SB/bin:$PATH" STUB_DOCKER_RUNNING="$1" gitlab_mode ); }
+assert_eq "container" "$(mode_of 1)" "gitlab_mode：gitlab 容器執行中 → container"
+assert_eq "deb" "$(mode_of '')" "gitlab_mode：沒有容器 → deb"
+assert_eq "deb" "$(mode_of stopped)" "gitlab_mode：容器已停止 → deb"
+assert_eq "deb" "$(mode_of runner)" "gitlab_mode：只有 gitlab-runner 容器 → deb"
+assert_eq "deb" "$(mode_of down)" "gitlab_mode：docker 失敗 → deb"
+nodocker="$T_TMP/emptybin"; mkdir -p "$nodocker"
+assert_eq "deb" "$( PATH="$nodocker" gitlab_mode )" "gitlab_mode：沒有 docker 指令 → deb"
+assert_eq "docker"$'\n'"exec"$'\n'"gitlab"$'\n'"gitlab-backup"$'\n'"create"$'\n'"CRON=1" \
+    "$( PATH="$SB/bin:$PATH" STUB_DOCKER_RUNNING=1 gitlab_exec_args gitlab-backup create CRON=1 )" "gitlab_exec_args：容器模式加 docker exec gitlab 前綴"
+assert_eq "gitlab-ctl"$'\n'"backup-etc" "$( PATH="$SB/bin:$PATH" gitlab_exec_args gitlab-ctl backup-etc )" "gitlab_exec_args：deb 模式只有指令本身"
+
+# backup_auto.sh：容器模式沙箱（沒有 /opt/gitlab、宿主機沒有 gitlab-backup／gitlab-ctl）
+setup_container() { # setup_container <名稱>
+    setup_sandbox "$1"
+    rmdir "$SB/opt"
+    rm -f "$SB/bin/gitlab-backup" "$SB/bin/gitlab-ctl"
+    export STUB_DOCKER_RUNNING=1
+}
+setup_container c_ok
+out="$(env_run '' "$auto")"; rc=$?
+assert_eq "0" "$rc" "容器模式備份成功：結束碼 0"
+assert_eq "docker exec gitlab gitlab-backup create CRON=1" "$(sed -n 1p "$STUB_LOG")" "容器模式：先 docker exec 資料備份"
+assert_eq "docker exec gitlab gitlab-ctl backup-etc" "$(sed -n 2p "$STUB_LOG")" "容器模式：再 docker exec 設定備份"
+assert_eq "2" "$(wc -l <"$STUB_LOG" | tr -d ' ')" "容器模式：只有這兩個 docker 呼叫"
+assert_contains "$(cat "$SB/backup.log")" "備份完成" "容器模式：日誌記錄完成"
+
+setup_container c_data_fail
+env_run '' "$auto" STUB_BACKUP_RC=1 >/dev/null; rc=$?
+assert_eq "1" "$rc" "容器模式資料備份失敗：結束碼 1"
+assert_eq "1" "$(count_log '^docker exec gitlab gitlab-backup create CRON=1')" "容器模式資料備份失敗：確實走 docker exec"
+assert_eq "0" "$(count_log 'backup-etc')" "容器模式資料備份失敗：不做設定備份"
+setup_container c_etc_fail
+env_run '' "$auto" STUB_ETC_RC=1 >/dev/null; rc=$?
+assert_eq "2" "$rc" "容器模式設定備份失敗：結束碼 2"
+
+setup_container c_prune
+: >"$SB/cfg/gitlab_config_1000_2026_01_01.tar"
+: >"$SB/cfg/gitlab_config_3000_2026_10_15.tar"
+: >"$SB/data/1111_2025_01_01_18.0.0_gitlab_backup.tar"
+touch -d "8 days ago" "$SB/cfg/gitlab_config_1000_2026_01_01.tar"
+touch -d "6 days ago" "$SB/cfg/gitlab_config_3000_2026_10_15.tar"
+touch -d "10 days ago" "$SB/data/1111_2025_01_01_18.0.0_gitlab_backup.tar"
+env_run '' "$auto" >/dev/null
+assert_eq "no" "$([ -e "$SB/cfg/gitlab_config_1000_2026_01_01.tar" ] && echo yes || echo no)" "容器模式：8 天前的設定備份被清理"
+assert_eq "yes" "$([ -e "$SB/cfg/gitlab_config_3000_2026_10_15.tar" ] && echo yes || echo no)" "容器模式：6 天前的設定備份保留"
+assert_eq "yes" "$([ -e "$SB/data/1111_2025_01_01_18.0.0_gitlab_backup.tar" ] && echo yes || echo no)" "容器模式：資料備份不歸本腳本清理"
+
+# backup.sh 選單：容器模式下立即備份與 crontab 註冊／移除
+setup_container c_menu_now
+out="$(run_bk '1\nq\n')"
+assert_eq "docker exec gitlab gitlab-backup create CRON=1" "$(sed -n 1p "$STUB_LOG")" "容器模式選單 1：docker exec 資料備份"
+assert_contains "$out" "備份完成" "容器模式選單 1：成功訊息"
+setup_container c_menu_cron
+run_bk '4\n\nq\n' >/dev/null
+run_bk '4\n\nq\n' >/dev/null
+assert_eq "1" "$(grep -c 'gitlab-ops:backup_auto' "$CRON_FILE")" "容器模式選單 4：重複註冊只有一筆"
+run_bk '5\nq\n' >/dev/null
+assert_eq "0" "$(grep -c 'gitlab-ops:backup_auto' "$CRON_FILE" || true)" "容器模式選單 5：移除"
+unset STUB_DOCKER_RUNNING
 
 # ── backup.sh 選單 ──
 setup_sandbox menu

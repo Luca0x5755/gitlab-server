@@ -136,6 +136,44 @@ require_machine() {
     esac
 }
 
+# ── GitLab 執行模式（deb 或容器）─────────────────────────────────────────────
+
+# 名為 gitlab 的容器正在執行才算容器模式（名稱完全相等；gitlab-runner、已停止、
+# docker 沒裝或連不上都不算），其餘一律 deb：容器不在就照舊走 deb，不猜。
+gitlab_mode() {
+    local running
+    if have_cmd docker \
+        && running="$(docker inspect --type container -f '{{.State.Running}}' gitlab 2>/dev/null)" \
+        && [ "$running" = true ]; then
+        echo container
+    else
+        echo deb
+    fi
+}
+
+# 組出要執行的完整指令，一詞一行：容器模式加上 `docker exec gitlab` 前綴，deb 模式原樣。
+# 不加 -t：cron 沒有 tty。
+gitlab_exec_args() { # gitlab_exec_args <指令…>
+    if [ "${_GITLAB_MODE:-$(gitlab_mode)}" = container ]; then
+        printf '%s\n' docker exec gitlab "$@"
+    else
+        printf '%s\n' "$@"
+    fi
+}
+
+# 依目前模式執行 GitLab 指令（gitlab-backup、gitlab-ctl…），回傳該指令的結束碼。
+# 若呼叫端已把模式存進 _GITLAB_MODE（不 export），就用它，不再重新探測。
+gitlab_run() { # gitlab_run <指令…>
+    local -a cmd
+    mapfile -t cmd < <(gitlab_exec_args "$@")
+    "${cmd[@]}"
+}
+
+# 備份類動作的機器檢查：容器模式（deb 已移除也成立）直接通過，否則等同 require_machine server。
+require_gitlab_host() {
+    [ "${_GITLAB_MODE:-$(gitlab_mode)}" = container ] || require_machine server
+}
+
 # 會改系統檔的動作先確認是 root，免得做到一半才因權限失敗而留下半套狀態。
 require_root() {
     [ "$(current_uid)" -eq 0 ] || die "需要 root 權限，請用 sudo 執行。"

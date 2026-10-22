@@ -240,7 +240,7 @@ TXT
 
 backup_now() {
     local rc=0
-    require_machine server
+    require_gitlab_host
     require_root
     bash "$_bk_dir/backup_auto.sh" || rc=$?
     case "$rc" in
@@ -289,7 +289,7 @@ set_keep_time() {
 
 register_cron() {
     local sched script line cur
-    require_machine server
+    require_gitlab_host
     require_root
     have_cmd crontab || die "找不到 crontab 指令。"
     script="$_bk_dir/backup_auto.sh"
@@ -305,7 +305,7 @@ register_cron() {
 
 unregister_cron() {
     local cur
-    require_machine server
+    require_gitlab_host
     require_root
     have_cmd crontab || die "找不到 crontab 指令。"
     cur="$(read_crontab)"
