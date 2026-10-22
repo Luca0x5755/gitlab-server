@@ -40,7 +40,12 @@
 **說明與測試（DKR）**
 - PR-DKR-30 — 選單含「說明」與「常見問題排查」（遷移順序、為何要經 18.11、Git SSH 埠改 2222、權限錯誤時的 `update-permissions`、容器起不來時的檢查）。
 - PR-DKR-31 — 純函式（版本排序、映像 tag 組合、`docker run` 參數組裝、管理區塊移除）有 bash 測試且通過；`docker`、`apt` 等真實動作在 Ubuntu 24.04 試跑，不宣稱已驗證。
-- PR-DKR-32 — `README.md` 腳本表新增 `docker.sh`。
+- PR-DKR-32 — `README.md` 腳本表新增 `docker.sh`，並標明 `install.sh`、`nginx.sh`、`upgrade.sh` 僅適用 deb 安裝。
+
+**容器版日常備份（DKR）**
+- PR-DKR-40 — `backup_auto.sh` 在 GitLab 容器模式下，以 `docker exec gitlab gitlab-backup create` 產生資料備份、以 `docker exec gitlab gitlab-ctl backup-etc` 產生設定備份；deb 模式的行為不變。
+- PR-DKR-41 — 容器模式下資料備份失敗仍以非 0 結束，資料備份與設定備份同樣保留 7 天（同 `PR-BAK-02`、`03`、`12`）。
+- PR-DKR-42 — 容器模式下「立即備份」與「註冊／移除 crontab」可用，重複註冊不產生重複項目（同 `PR-BAK-01`、`10`）。
 
 ## Out of scope
 - **Runner 的安裝與註冊**：沿用 `runner.sh`，在遷移與升級完成、GitLab 穩定在 19.5.1 之後才執行；本案只動它的 Docker 安裝部分（PR-DKR-04）。
@@ -51,6 +56,7 @@
 - **機外備份的自動複製**：由使用者手動複製並輸入確認字串。
 - **19.8 及之後的停靠站**、GitLab EE、多節點、Geo。
 - **備份不含的項目**（Object Storage、Mattermost、Redis、server hooks）：另外處理，承接 `PR-BAK-09`。
+- **改寫或刪除 deb 專用腳本**：`install.sh`、`nginx.sh`、`upgrade.sh` 本案不動，它們對 deb 安裝仍成立，所以 `PR-INS`、`PR-NGX`、`PR-UPG` 不標為 retired；只在 README 標明適用範圍。`backup.sh` 的還原項目在容器模式下的行為本案不處理。
 
 ## Decisions
 - 沿用掛載目錄、遷移後 purge 舊 deb、停靠站與 patch 版本：見 `docs/adr/0001-gitlab-moves-to-docker-with-in-place-data.md`。被否決：備份再還原、先在 deb 上升到 19.5 再遷移、18.10.3 直接到 19.2。
@@ -60,7 +66,7 @@
 訪談後補定的預設值（未逐題討論）：逐站升級只處理比目前高的映像（類比 `PR-UPG-02`）；背景遷移逾時行為類比 `PR-UPG-06`；遷移與升級的確認字串形式由實作時定。若不合意，改對應 promise 即可。
 
 ## Open questions
-1. **既有 deb 腳本的去向**：`upgrade.sh`（吃 `.deb`）、`nginx.sh`（外部 Nginx）、`install.sh`（deb 安裝）、`backup.sh`／`backup_auto.sh`（宿主機直接跑 `gitlab-ctl`）在容器版之後是改寫、刪除，還是標示為僅適用 deb 安裝？決定後，對應的 `PR-UPG-*`、`PR-NGX-*`、`PR-INS-*`、`PR-BAK-*` 要逐條改寫或標為 retired。由使用者在 `/to-tickets` 拆票前決定。
+1. **容器模式下 `backup.sh` 的還原項目**：本案不處理（見 Out of scope）。若之後要在容器上還原，需另立 spec。
 2. **`apt purge gitlab-ce` 對掛載目錄與運行中容器的影響**：預期不刪 `/var/opt/gitlab` 與 `/etc/gitlab`，但套件的 prerm／postrm 是否會動到容器正在用的檔案，需在 Ubuntu 24.04 試跑。若有影響，purge 改為「停容器 → purge → 啟容器」。PR-DKR-18 的驗證步驟就是為此留的。
 3. **UID 對齊、容器內 `gitlab-ctl backup-etc`、18.11 的 PostgreSQL 升級耗時與磁碟需求**：都要在實際資料上實測，才能決定 PR-DKR-14、21、23 的細節與警告門檻。由使用者在目標機器或相同大小的資料副本上試跑。
 4. **`ufw` 與 Docker 發佈埠**：Docker 直接寫 iptables，`ufw` 規則擋不住它發佈的 80／443／2222。是否要額外限制來源網段？由使用者決定；不決定則維持現狀。
