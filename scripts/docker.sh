@@ -3,7 +3,7 @@
 # 頂層只定義函式，不執行任何動作；`set -euo pipefail` 與 `cd` 都在 main 內，
 # 所以測試可以 source 本檔取得函式而不啟動選單。
 #
-# 後續票（遷移、逐站升級、說明與排查）在對應分區追加。
+# 遷移（deb → GitLab 容器）見 docker_migrate；後續票（purge、逐站升級、說明與排查）在對應分區追加。
 
 _glc_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
@@ -46,6 +46,243 @@ docker_normalize_versions() { # docker_normalize_versions "<清單>"
 
 # ask_param 用的驗證函式：清單合法回 0。
 valid_docker_version_list() { docker_normalize_versions "$1" >/dev/null 2>&1; }
+
+
+# ── 遷移用純函式（ISSUE-004）─────────────────────────────────────────────────
+
+# 三個掛載目錄（GLOSSARY），宿主機與容器路徑相同；逐行輸出 `-v` 與 `src:dst`。
+GLC_MOUNT_DIRS="/etc/gitlab /var/opt/gitlab /var/log/gitlab"
+docker_mount_args() {
+    local d
+    for d in $GLC_MOUNT_DIRS; do printf '%s\n%s\n' "-v" "$d:$d"; done
+}
+
+# `docker run` 後面的整串參數，一行一個（值都不含空白）。容器名 gitlab、--restart always、
+# --shm-size 256m、發佈 80／443 與 Git SSH 埠 2222→22（宿主機 sshd 的 22 不動）。
+docker_run_args() { # docker_run_args <映像參照>
+    [ -n "${1:-}" ] || return 1
+    printf '%s\n' -d --name gitlab --restart always --shm-size 256m \
+        -p 80:80 -p 443:443 -p "$GLC_SSH_PORT:22"
+    docker_mount_args
+    printf '%s\n' "$1"
+}
+
+
+# 遷移時移除的外部 Nginx 管理區塊（名稱與 nginx.sh 的 NGX_EXT_BLOCK 相同）與新增的 Git SSH 埠區塊。
+GLC_NGX_BLOCK="nginx_external"
+GLC_SSH_BLOCK="docker_ssh_port"
+GLC_SSH_PORT=2222
+
+# 遷移後的 gitlab.rb 全文（stdout，不寫檔）：先移除外部 Nginx 區塊，再以管理區塊設定 Git SSH 埠。
+# 重用 common.sh 的 strip_block／replace_block；標記毀損或讀不到檔案回非 0 且不輸出。
+docker_migrate_rb_content() { # docker_migrate_rb_content <gitlab.rb>
+    local stripped tmp rc=0
+    # 結尾補 x 保住最後的換行；strip_block 的結束碼要在子 shell 內帶出來。
+    stripped="$(strip_block "$1" "$GLC_NGX_BLOCK" && echo x)" || return 1
+    tmp="$(umask 077 && mktemp)" || return 1
+    printf '%s' "${stripped%x}" >"$tmp"
+    replace_block "$tmp" "$GLC_SSH_BLOCK" "gitlab_rails['gitlab_shell_ssh_port'] = $GLC_SSH_PORT" || rc=$?
+    rm -f "$tmp"
+    return "$rc"
+}
+
+# `ss -Hltn` 輸出（stdin）中監聽 80、443 或 2222 的列（本機位址欄以 :埠 結尾）。
+docker_busy_listeners() { awk '$4 ~ /:(80|443|2222)$/'; }
+
+# 取 gitlab.rb 中最後一個未註解的 external_url（去掉引號）；沒有回非 0。
+docker_external_url() { # docker_external_url <gitlab.rb>
+    local url
+    url="$(sed -n -E "s/^[[:space:]]*external_url[[:space:]]+['\"]([^'\"]+)['\"].*/\1/p" "$1" 2>/dev/null | tail -n1)"
+    [ -n "$url" ] || return 1
+    echo "$url"
+}
+
+# deb 版本與要啟動的映像 tag 相同才回 0（兩者都須是合法版本）。
+docker_version_matches() { # docker_version_matches <deb 版本> <tag>
+    [ "$(version_cmp "$1" "$2" 2>/dev/null)" = 0 ]
+}
+
+# 位元組數 → 人看的大小（1024 進位，B／KiB／MiB／GiB／TiB）。
+format_bytes() { # format_bytes <位元組>
+    awk -v b="$1" 'BEGIN {
+        if (b < 1024) { printf "%d B\n", b; exit }
+        split("KiB MiB GiB TiB", u, " "); v = b; i = 0
+        while (v >= 1024 && i < 4) { v /= 1024; i++ }
+        printf "%.1f %s\n", v, u[i]
+    }'
+}
+
+# HTTP 狀態碼 2xx／3xx 視為服務有回應（GitLab 首頁會 302 到登入頁）。
+http_status_ok() { [[ $1 =~ ^[23][0-9][0-9]$ ]]; }
+
+# ── 遷移動作（ISSUE-004；每個階段獨立成函式，失敗即 die 並說明）──────────────────
+
+# deb 安裝的 gitlab-ce 版本；獨立成函式讓測試能換掉。
+docker_deb_version() { dpkg-query -W -f='${Version}\n' gitlab-ce; }
+
+# 資料目錄（含 git-data/repositories）；GLC_DATA_DIR 供測試覆寫。
+glc_data_dir() { echo "${GLC_DATA_DIR:-/var/opt/gitlab}"; }
+
+# PR-DKR-10 前置檢查：deb 版本等於要啟動的映像 tag、Docker 已安裝、映像已載入。
+# 另擋兩個會讓容器起不來的狀況：已有名為 gitlab 的容器、git-data/repositories 不是真目錄。
+docker_preflight() { # docker_preflight <tag>
+    local tag="$1" ref deb repos
+    ref="$(docker_image_ref "$tag")" || die "前置檢查失敗：映像 tag 不合法：$tag"
+    have_cmd docker || die "前置檢查失敗：Docker 未安裝。請先執行選單 4 安裝 Docker。"
+    deb="$(docker_deb_version)" || die "前置檢查失敗：讀不到 deb 安裝的 gitlab-ce 版本。這個動作只適用 deb 安裝的 GitLab。"
+    docker_version_matches "$deb" "$tag" \
+        || die "前置檢查失敗：deb 版本（$deb）與要啟動的映像 tag（$tag）不同。版本必須一致才能沿用資料目錄。"
+    docker image inspect "$ref" >/dev/null 2>&1 \
+        || die "前置檢查失敗：映像 $ref 尚未載入。請先執行選單 2 載入 GitLab 映像包。"
+    [ -z "$(docker ps -a --filter name=^gitlab$ --format '{{.Names}}')" ] \
+        || die "前置檢查失敗：已有名為 gitlab 的容器。請先確認它的狀況（docker ps -a），本動作不覆蓋既有容器。"
+    repos="$(glc_data_dir)/git-data/repositories"
+    [ -d "$repos" ] \
+        || die "前置檢查失敗：$repos 不存在或是壞掉的 symlink，容器啟動會報 stat: missing operand。請先修好再重試。"
+    echo "✓ 前置檢查通過：deb $deb、映像 $ref 已載入。"
+}
+
+
+# 機外備份確認字串（不是密碼，不需隱藏）。
+GLC_OFFSITE_PHRASE="offsite-copied"
+
+# 呼叫現有 backup_auto.sh（deb 還活著，所以仍是 deb 模式）；獨立成函式讓測試能換掉。
+docker_run_backup() { bash "$_glc_dir/backup_auto.sh"; }
+
+# <目錄> 內符合 <樣式>、且比 <標記檔> 新的最新檔案路徑；沒有回非 0。
+# 要求比標記新：backup_auto.sh 就算回 0 卻什麼都沒寫，也不會把舊備份當成剛做好的。
+_glc_newest() { # _glc_newest <目錄> <樣式> <標記檔>
+    local f best=""
+    for f in "$1"/$2; do
+        [ -f "$f" ] && [ "$f" -nt "$3" ] || continue
+        if [ -z "$best" ] || [ "$f" -nt "$best" ]; then best="$f"; fi
+    done
+    [ -n "$best" ] || return 1
+    echo "$best"
+}
+
+# PR-DKR-11：備份 → 列出兩個檔案的路徑與大小 → 要求輸入確認字串。任一步失敗即中止，此時還沒動 deb 版。
+docker_backup_stage() {
+    local data cfg ans="" mark rc=0
+    echo "══ 備份 ══"
+    mark="$(mktemp)" || die "備份失敗：無法建立暫存檔，deb 版未被更動。"
+    # 以 mtime 標記區分「這次做的」與舊備份。
+    docker_run_backup || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        data="$(_glc_newest "$(data_backup_dir)" '*_gitlab_backup.tar' "$mark")" || rc=data
+        [ "$rc" != 0 ] || cfg="$(_glc_newest "$(config_backup_dir)" 'gitlab_config_*.tar' "$mark")" || rc=cfg
+    fi
+    rm -f "$mark"
+    case "$rc" in
+        0) ;;
+        data) die "備份失敗：在 $(data_backup_dir) 找不到這次產生的資料備份，已中止，deb 版未被更動。" ;;
+        cfg) die "備份失敗：在 $(config_backup_dir) 找不到這次產生的設定備份，已中止，deb 版未被更動。" ;;
+        *) die "備份失敗（結束碼 $rc），已中止，deb 版未被更動。請先排除備份問題。" ;;
+    esac
+    echo "資料備份：$data（$(format_bytes "$(stat -c %s "$data")")）"
+    echo "設定備份：$cfg（$(format_bytes "$(stat -c %s "$cfg")")）"
+    echo "⚠ 這台沒有退路。請把上面兩個檔案複製到這台機器以外的地方（兩者缺一不可）。"
+    read -r -p "已複製到機外？輸入 $GLC_OFFSITE_PHRASE 繼續：" ans || true
+    [ "$ans" = "$GLC_OFFSITE_PHRASE" ] || die "未輸入確認字串，已中止，deb 版未被更動。"
+    echo "✓ 備份完成並已確認複製到機外。"
+}
+
+
+# PR-DKR-12：移除 nginx.sh 的管理區塊、設定 Git SSH 埠 2222。只備份一次、直接寫入，
+# 不在宿主機 reconfigure（deb 即將停用，設定由容器啟動時套用）。不動 external_url 與 ssl。
+docker_edit_gitlab_rb() {
+    local f new
+    f="$(gitlab_rb_file)"
+    echo "══ 改 gitlab.rb ══"
+    new="$(umask 077 && mktemp)" || die "改 gitlab.rb 失敗：無法建立暫存檔。"
+    if ! docker_migrate_rb_content "$f" >"$new"; then
+        rm -f "$new"
+        die "改 gitlab.rb 失敗：無法產生新內容（檔案不存在或管理區塊標記毀損），gitlab.rb 未被更動。"
+    fi
+    if ! backup_gitlab_rb; then
+        rm -f "$new"
+        die "改 gitlab.rb 失敗：備份失敗，gitlab.rb 未被更動。"
+    fi
+    if ! write_file_from "$new" "$f"; then
+        rm -f "$new"
+        restore_gitlab_rb "$LAST_GITLAB_RB_BAK" || true
+        die "改 gitlab.rb 失敗：寫入失敗，已嘗試由備份還原。"
+    fi
+    rm -f "$new"
+    echo "✓ 已移除外部 Nginx 區塊並設定 gitlab_shell_ssh_port = $GLC_SSH_PORT。"
+}
+
+# PR-DKR-13：停 deb 版並停用開機服務，再確認 80、443、2222 未被占用。
+docker_stop_deb() {
+    local busy out
+    echo "══ 停止 deb 版 GitLab ══"
+    gitlab-ctl stop || die "停止 deb 版失敗（gitlab-ctl stop）。"
+    systemctl disable --now gitlab-runsvdir || die "停用 deb 版開機服務（gitlab-runsvdir）失敗。此時 deb 版已停止、gitlab.rb 已改；請手動停用該服務並確認 80／443／2222 空閒後，從啟動容器接續。"
+    have_cmd ss || die "缺少指令 ss，無法確認 80／443／2222 已釋放。"
+    out="$(ss -Hltn)" || die "ss 執行失敗，無法確認 80/443/2222 已釋放。"
+    busy="$(docker_busy_listeners <<<"$out")"
+    if [ -n "$busy" ]; then
+        echo "✗ 80、443 或 2222 仍被佔用：" >&2
+        printf '%s\n' "$busy" | sed 's/^/  /' >&2
+        die "請先停掉佔用的程式再重試（sudo ss -tlnp 可看是誰）。"
+    fi
+    echo "✓ deb 版已停止，80、443、2222 空閒。"
+}
+
+# PR-DKR-14：以暫時容器掛三個掛載目錄跑 update-permissions，對齊 UID。不手動 chown。
+docker_align_permissions() { # docker_align_permissions <映像參照>
+    local args=()
+    echo "══ 對齊權限 ══"
+    mapfile -t args < <(docker_mount_args)
+    docker run --rm "${args[@]}" "$1" update-permissions \
+        || die "對齊權限失敗（update-permissions）。請勿手動 chown 成 root:root；見 docker logs 或說明。"
+    echo "✓ 權限已對齊。"
+}
+
+# PR-DKR-15：以純函式組裝的參數啟動 GitLab 容器。
+docker_start_container() { # docker_start_container <映像參照>
+    local args=()
+    echo "══ 啟動 GitLab 容器 ══"
+    mapfile -t args < <(docker_run_args "$1")
+    docker run "${args[@]}" || die "啟動容器失敗（docker run）。"
+    echo "✓ 已啟動容器 gitlab。"
+}
+
+# PR-DKR-16：輪詢到容器 healthy 才算成功；容器已結束或逾時即失敗並指向 docker logs gitlab。
+# 間隔與次數可由 GLC_HEALTH_INTERVAL（預設 10 秒）、GLC_HEALTH_MAX（預設 90 次）調整。
+docker_wait_healthy() {
+    local interval="${GLC_HEALTH_INTERVAL:-10}" max="${GLC_HEALTH_MAX:-90}" i out state health
+    echo "══ 等待容器健康 ══"
+    for ((i = 1; i <= max; i++)); do
+        out="$(docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' gitlab 2>/dev/null)" || out=""
+        state="${out%% *}"
+        health="${out#* }"
+        if [ "$health" = healthy ]; then
+            echo "✓ 容器已健康。"
+            return 0
+        fi
+        case "$state" in
+            exited | dead | removing)
+                die "容器已結束（$state）。請看 docker logs gitlab 找原因。"
+                ;;
+        esac
+        echo "  第 $i 次：${out:-（讀不到狀態）}，等待中..."
+        [ "$i" -ge "$max" ] || sleep "$interval"
+    done
+    die "等了 $max 次容器仍不健康，已停止。請看 docker logs gitlab 找原因。"
+}
+
+# PR-DKR-17：容器內 gitlab:check，再 curl -kI external_url（自簽憑證所以 -k）；狀態碼 2xx／3xx 才通過。
+docker_verify() {
+    local url code
+    echo "══ 驗證 ══"
+    url="$(docker_external_url "$(gitlab_rb_file)")" || die "驗證失敗：在 $(gitlab_rb_file) 找不到 external_url。"
+    docker exec gitlab gitlab-rake gitlab:check || die "驗證失敗：gitlab:check 未通過。"
+    code="$(curl -ksI --max-time 30 -o /dev/null -w '%{http_code}' "$url")" || code="000"
+    http_status_ok "$code" || die "驗證失敗：curl -kI $url 回應 $code（需 2xx／3xx）。"
+    echo "✓ gitlab:check 通過，$url 回應 $code。"
+}
+
 
 # ── 動作 ─────────────────────────────────────────────────────────────────────
 
@@ -126,6 +363,36 @@ docker_install_offline() {
     echo "✓ 已安裝 Docker。下一步：載入 GitLab 映像包。"
 }
 
+# ask_param 用的驗證函式：起始 tag 可帶或不帶 -ce.N 後綴。
+valid_docker_start_tag() { valid_gitlab_version "$(_glc_with_suffix "$1")"; }
+
+# 【GitLab 伺服器】deb → GitLab 容器（沿用掛載目錄）。依序：前置檢查、確認、備份、改 gitlab.rb、
+# 停 deb、對齊權限、啟動、等健康、驗證；任一步失敗即中止（各階段 die 並說明）。
+# 用 server 角色：此時 deb 必須還在（/opt/gitlab 存在）；purge 之後的動作（ISSUE-006）不走這裡。
+# 本函式結束時 deb 套件仍在，GitLab 已由容器服務。
+docker_migrate() {
+    local tag ref
+    require_machine server
+    require_root
+    tag="$(ask_param GLC_START_TAG "要啟動的映像版本（須與 deb 版本相同）" "$(_glc_with_suffix "${GLC_DEFAULT_VERSIONS%% *}")" valid_docker_start_tag)" \
+        || die "映像版本不合法（須為 X.Y.Z 形式，例如 18.10.3）。"
+    tag="$(_glc_with_suffix "$tag")"
+    ref="$(docker_image_ref "$tag")" || die "映像版本不合法：$tag"
+    docker_preflight "$tag"
+    echo "將把 deb 安裝的 GitLab 遷移到容器 $ref（沿用 /etc/gitlab、/var/opt/gitlab、/var/log/gitlab）："
+    echo "  備份 → 改 gitlab.rb → 停 deb 版 → 啟動容器 → 驗證。GitLab 會中斷數分鐘；deb 套件此步不移除。"
+    confirm "確定開始遷移？" || { echo "已取消，未做任何變更。"; return 0; }
+    docker_backup_stage
+    docker_edit_gitlab_rb
+    docker_stop_deb
+    docker_align_permissions "$ref"
+    docker_start_container "$ref"
+    docker_wait_healthy
+    docker_verify
+    echo "✓ 遷移完成：GitLab 已由容器 $ref 服務（deb 套件仍在）。"
+}
+
+
 # ── 選單 ─────────────────────────────────────────────────────────────────────
 
 show_menu() {
@@ -135,6 +402,7 @@ show_menu() {
   2) 載入 GitLab 映像包（docker load）  【GitLab 伺服器】
   3) 打包 Docker 離線包                【有網路的電腦】
   4) 安裝 Docker（含啟用服務）          【GitLab 伺服器】
+  5) 遷移到 Docker（沿用現有資料）      【GitLab 伺服器】
   q) 離開
 TXT
 }
@@ -145,6 +413,7 @@ dispatch() {
         2) docker_load_bundle ;;
         3) docker_build_offline ;;
         4) docker_install_offline ;;
+        5) docker_migrate ;;
         *) echo "✗ 無此選項：$1" >&2 ;;
     esac
 }
