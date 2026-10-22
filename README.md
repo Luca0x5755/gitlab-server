@@ -30,6 +30,7 @@ gitlab-server/
 | [upgrade.sh](scripts/upgrade.sh) | 版本升級：吃一個 `.deb` 資料夾，逐版升級並等背景遷移歸零 |
 | [nginx.sh](scripts/nginx.sh) | 外部 Nginx：離線打包與安裝、停用內建 Nginx、反向代理設定、切回內建 |
 | [network.sh](scripts/network.sh) | 以 Netplan 設定固定 IP |
+| [runner.sh](scripts/runner.sh) | GitLab Runner（CI）：離線打包與安裝 Docker、載入 image、註冊 instance runner、驗證、取消註冊、清理 |
 
 ## ⚠️ 注意事項
 

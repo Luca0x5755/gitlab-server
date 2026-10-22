@@ -14,3 +14,7 @@
 - 2026-10-20 `network.sh` 與 `install.sh` 的安裝動作的機器檢查只要求 Ubuntu 工具，不要求 `/opt/gitlab`（`network.sh` 為 `apt`、`netplan`、`ip`；`install.sh` 的 `dpkg -i` 前為 `require_machine ubuntu dpkg`）；`require_machine` 以機器角色（`online`/`server`/`ubuntu`）命名 — 固定 IP 與安裝 `.deb` 都發生在 GitLab 安裝之前，偏離 PR-COM-04 字面（環境不符時中止並說明應在哪台執行仍成立）。安裝後才有意義的動作（改 `gitlab.rb`、讀初始密碼）仍用 `server` 角色。
 - 2026-10-20 PR-INS-05 視為 PR-COM-06 的唯一例外，只涵蓋 `initial_root_password` 那一行：它是 GitLab 產生、24 小時失效的一次性初始密碼；不寫參數檔、日誌、命令列，解析失敗退回請 `sudo cat` 該檔；LDAP bind 密碼不適用此例外 — 不顯示就沒辦法登入，但仍把露出面降到最小。
 - 2026-10-20 `nginx.sh` 三項防呆偏離 04 文件：相依錯誤解析 `dpkg -i` 自身輸出而非 `dpkg -l | grep nginx`（後者漏掉非 nginx 名稱的相依）、來源行寫死 noble 故 codename 必須為 noble、下載前確認 `apt-cache policy nginx` 的候選版本來自 nginx.org（避免打包到 Ubuntu 自家 nginx）。
+- 2026-10-21 CI 用 GitLab Runner，與 GitLab 同機（POC）、Docker executor、instance runner、不開特權；新增 `scripts/runner.sh` 選單腳本，機器角色沿用 `server` — 同機會搶資源，故 `concurrent` 預設 1、安裝前警告磁碟剩餘低於 20 GB，不排自動清理 cron；POC 求簡單，日後要隔離再改專用 Runner 主機。
+- 2026-10-21 Runner 版本與 GitLab 版本不一致時警告並詢問，不硬擋；token 由使用者在後台建立後隱藏輸入貼上，不用管理員 PAT 自動建立 — 不多持有一個高權限秘密。
+- 2026-10-21 job 容器以 `clone_url` 指向區網 IP 連回 GitLab（不用 host 網路），HTTPS 時複製 CA 到 `/etc/gitlab-runner/certs/` — 容器內的 127.0.0.1 是容器自己；離線 image 預設 alpine:3.20、ubuntu:24.04、node:22、python:3.13、docker:27-cli，可由 `ask_param` 改。
+- 2026-10-21 POC 的 `external_url` 為自簽憑證 HTTPS：Runner 以該憑證本身當 CA（`tls-ca-file`），註冊前用 `openssl` 檢查憑證 SAN 涵蓋 `clone_url` 的主機（IP 或網域），不涵蓋就中止並說明需重簽 — 憑證只有 CN 或缺該 IP 時，job 的 `git clone` 會憑證驗證失敗。

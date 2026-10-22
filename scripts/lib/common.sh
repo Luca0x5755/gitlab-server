@@ -469,3 +469,85 @@ deb_version() {
     echo "$ver"
 }
 
+
+# ── 離線套件包（打包與解包前的檢查）──────────────────────────────────────────
+
+# 檢查離線包可以安全解開：必須是 gzip tar、至少一個 .deb、每個條目名稱符合白名單
+# （扁平、只含 [A-Za-z0-9._+~%-]，%3a 是 epoch 的檔名編碼；因此 ./x.deb、sub/x.deb、
+# ../x.deb、/abs/x.deb、含空白者都被拒絕）、每個條目都是一般檔案（拒絕 symlink／hardlink／
+# 目錄／裝置）。不通過回非 0 並在 stderr 說明原因。
+check_offline_tar() {
+    local tar_file="$1" names types name t i=0 n
+    [ -f "$tar_file" ] || { echo "✗ 找不到離線包：$tar_file" >&2; return 1; }
+    gzip -t "$tar_file" 2>/dev/null || { echo "✗ 不是 gzip 壓縮檔：$tar_file" >&2; return 1; }
+    names="$(tar tzf "$tar_file" 2>/dev/null)" || { echo "✗ 無法讀取 tar 內容：$tar_file" >&2; return 1; }
+    types="$(tar tvzf "$tar_file" 2>/dev/null | cut -c1)" || { echo "✗ 無法讀取 tar 內容：$tar_file" >&2; return 1; }
+    [ -n "$names" ] || { echo "✗ 離線包內沒有任何 .deb：$tar_file" >&2; return 1; }
+    n="$(printf '%s\n' "$names" | wc -l)"
+    [ "$n" -eq "$(printf '%s\n' "$types" | wc -l)" ] || { echo "✗ tar 條目數不一致，拒絕解包：$tar_file" >&2; return 1; }
+    while IFS= read -r name; do
+        if ! [[ $name =~ ^[A-Za-z0-9._+~%-]+\.deb$ ]]; then
+            echo "✗ 離線包含不合規的條目（只接受扁平的 .deb 檔名）：$name" >&2
+            return 1
+        fi
+    done <<<"$names"
+    while IFS= read -r t; do
+        i=$((i + 1))
+        if [ "$t" != "-" ]; then
+            echo "✗ 離線包的條目不是一般檔案（類型 $t）：$(printf '%s\n' "$names" | sed -n "${i}p")" >&2
+            return 1
+        fi
+    done <<<"$types"
+}
+
+# 把 <來源目錄> 內的 *.deb 打成扁平的 tar.gz。先寫同目錄的暫存檔，驗證通過才 mv 過去：
+# 任何一步失敗都清掉暫存檔，既有的輸出檔原樣保留。
+pack_offline() { # pack_offline <來源目錄> <輸出 tar.gz>
+    local src="$1" out="$2" f tmp
+    local names=()
+    for f in "$src"/*.deb; do
+        [ -e "$f" ] && names+=("${f##*/}")
+    done
+    [ "${#names[@]}" -gt 0 ] || { echo "✗ $src 內沒有任何 .deb，不打包。" >&2; return 1; }
+    mkdir -p "$(dirname "$out")" || return 1
+    tmp="$(mktemp "$out.XXXXXX")" || return 1
+    if tar czf "$tmp" -C "$src" -- "${names[@]}" && check_offline_tar "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$out"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    echo "✗ 打包失敗，未產生 $out（既有檔案保持原樣）。" >&2
+    return 1
+}
+
+
+# 檢查必備指令。不重用 require_machine 的額外指令參數：它只在 ubuntu 角色生效，
+# online／server 角色會忽略；所以用 have_cmd 自查（nginx.sh、runner.sh 共用）。
+require_cmds() {
+    local c
+    for c in "$@"; do
+        have_cmd "$c" || die "缺少指令 $c。請在符合的機器上執行（見選單標示的【有網路的電腦】或【GitLab 伺服器】）。"
+    done
+}
+
+# 使用者的家目錄：sudo 下 $HOME 可能是 /root，所以有 SUDO_USER 時改用該使用者的家目錄。
+sudo_home_dir() {
+    local home="$HOME" h=""
+    if [ -n "${SUDO_USER:-}" ] && have_cmd getent; then
+        h="$(getent passwd "$SUDO_USER" | cut -d: -f6)" || h=""
+        [ -z "$h" ] || home="$h"
+    fi
+    echo "$home"
+}
+
+# 從 `apt-cache depends --recurse` 的 stdin 取出要下載的實體套件名（排序去重）。
+# 只收「整行就是一個套件名」的頂層行：
+#   - 縮排行（Depends:／提供者）不是頂層；
+#   - <虛擬套件> 以 < 開頭；
+#   - libc6:i386 這類其他架構含冒號，丟棄（原文件的 grep "^\w" 會放過它）。
+# 沒有任何套件名回非 0，讓呼叫端不會拿空清單去 apt-get download。
+parse_dep_pkgs() {
+    local out
+    out="$(grep -E '^[A-Za-z0-9][A-Za-z0-9.+-]*$' | LC_ALL=C sort -u)" || true
+    [ -n "$out" ] || return 1
+    printf '%s\n' "$out"
+}
