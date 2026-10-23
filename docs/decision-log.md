@@ -23,3 +23,4 @@
 - 2026-10-22 Docker 的離線安裝從 `runner.sh` 抽成共用函式，`docker.sh` 與 `runner.sh` 共用 — 避免兩份 `docker.io` 相依解析邏輯。
 - 2026-10-22 Runner 在遷移與升級到 19.5.1 穩定後才以 `runner.sh` 安裝（宿主機 deb、Docker executor、instance runner）— 尚未建置，沿用既有設計；順序放後面以免升級期間混入變因。
 - 2026-10-22 機外備份由使用者手動複製，腳本只列檔案與大小並要求輸入確認字串 — 內網機的目的地因環境而異，腳本不猜。
+- 2026-10-23 Docker 遷移 spec（ISSUE-001）隨佇列收斂刪除，promise 以測試中的 `PR-DKR-*` 註解為準；以下四項**尚未解決**，須在 Ubuntu 24.04 實機試跑後再決定，ADR 0001、0002 因此維持 `Proposed` — ①`apt purge gitlab-ce` 的 prerm／postrm 是否動到容器使用中的掛載目錄（若會，purge 改為停容器→purge→啟容器；`docker.sh` 的驗證步驟為此保留）；②UID 對齊、容器內 `gitlab-ctl backup-etc`、18.11 的 PostgreSQL 升級耗時與磁碟需求（決定 PR-DKR-14、21、23 的細節與警告門檻）；③`ufw` 擋不住 Docker 發佈的 80／443／2222，是否限制來源網段由使用者決定；④容器模式下 `backup.sh` 的還原項目未處理，需另立 spec。

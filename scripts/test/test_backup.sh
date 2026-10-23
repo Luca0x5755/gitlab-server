@@ -180,7 +180,7 @@ out="$(env_run '' "$auto")"
 assert_eq "0" "$(wc -l <"$STUB_LOG" | tr -d ' ')" "沒裝 GitLab：不做任何備份"
 assert_contains "$out" "【GitLab 伺服器】" "沒裝 GitLab：指向【GitLab 伺服器】"
 
-# ── 容器模式（PR-DKR-40、41、42）──
+# ── 容器模式（PR-DKR-40、PR-DKR-41、PR-DKR-42）──
 # 純函式：模式判斷與 docker exec 組裝（沙箱的假 docker）
 setup_sandbox mode
 mode_of() { ( PATH="$SB/bin:$PATH" STUB_DOCKER_RUNNING="$1" gitlab_mode ); }

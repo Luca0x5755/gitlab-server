@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC1090,SC1091
-# docker.sh 的「說明」「常見問題排查」（選單行程接縫）與 README 腳本表（ISSUE-008，PR-DKR-30／32）。
+# docker.sh 的「說明」「常見問題排查」（選單行程接縫）與 README 腳本表（ISSUE-008，PR-DKR-30、PR-DKR-32）。
 # 期望值一律寫死字面值。
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/helpers.sh"

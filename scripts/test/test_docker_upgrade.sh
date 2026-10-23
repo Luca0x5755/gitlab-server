@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC1090,SC1091,SC2016,SC2317,SC2034
-# docker.sh 逐站升級（ISSUE-007）：接縫 A 純函式、接縫 B 階段函式（假 docker）、接縫 C 選單。
+# docker.sh 逐站升級（ISSUE-007，PR-DKR-20～25、31）：接縫 A 純函式、接縫 B 階段函式（假 docker）、接縫 C 選單。
+# PR-DKR-22 每站重建容器、PR-DKR-25 全部完成後的 gitlab:check SANITIZE=true 與最終版本，見接縫 B 的 docker_upgrade_station／docker_upgrade。
+# PR-DKR-31 純函式（版本排序、tag 組合、docker run 參數組裝、管理區塊移除）的 bash 測試分布於 test_docker*.sh。
 # 期望值一律寫死字面值。
 # 未驗證：真實 docker 升級（含 18.11 的 PostgreSQL 自動升級）無法無人值守，這裡只用假指令，
 # 沒有任何真實環境驗證。
