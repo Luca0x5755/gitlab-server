@@ -26,6 +26,15 @@ assert_nonzero "含非法版本整批拒絕" docker_normalize_versions "18.10.3 
 assert_eq "" "$(docker_normalize_versions "18.10.3 abc" 2>/dev/null)" "含非法版本時不輸出任何 tag"
 assert_nonzero "空清單拒絕" docker_normalize_versions ""
 
+# ── docker_locale_dockerfile：把 deb 時代資料庫的 locale 烤進映像 ──
+df="$(docker_locale_dockerfile gitlab/gitlab-ce:19.5.1-ce.0 zh_TW.UTF-8)"
+assert_contains "$df" "FROM gitlab/gitlab-ce:19.5.1-ce.0" "Dockerfile 以官方映像為底"
+assert_contains "$df" "apt-get install -y --no-install-recommends locales" "安裝 locales 套件"
+assert_contains "$df" "localedef -i zh_TW -f UTF-8 zh_TW.UTF-8" "產生 zh_TW.UTF-8"
+assert_contains "$df" "grep -qi '^zh_TW\.UTF8$'" "建置時驗證 locale -a 看得到"
+assert_nonzero "locale 含注入字元拒絕" docker_locale_dockerfile x 'zh_TW.UTF-8;id'
+assert_nonzero "locale 格式錯誤拒絕" docker_locale_dockerfile x zhTW
+
 # ── valid_docker_version_list ──
 assert_status 0 "預設清單合法" valid_docker_version_list "$GLC_DEFAULT_VERSIONS"
 assert_eq "18.10.3 18.11.13 19.2.9 19.5.1" "$GLC_DEFAULT_VERSIONS" "預設版本清單"
@@ -48,6 +57,7 @@ setup_sandbox() { # setup_sandbox <名稱>
 case "$1" in
     pull) [ -n "${FAIL_PULL:-}" ] && [[ $2 == *"$FAIL_PULL"* ]] && exit 1; exit 0 ;;
     save) [ "${FAIL_SAVE:-}" = 1 ] && exit 1; [ "$2" = "-o" ] && echo fake-tar >"$3"; exit 0 ;;
+    build) cat >"$STUB_LOG.dockerfile"; [ "${FAIL_BUILD:-}" = 1 ] && exit 1; exit 0 ;;
     load) exit 0 ;;
     images) printf "gitlab/gitlab-ce   18.10.3-ce.0   abc   1 week ago   2GB\n"; exit 0 ;;
 esac'
@@ -58,12 +68,17 @@ esac'
 setup_sandbox build_ok
 printf '%s\n%s\n' "19.5.1 18.10.3" "$SB/out/gl.tar" | docker_build_bundle >"$SB/o.txt" 2>&1 && r=0 || r=$?
 assert_eq "0" "$r" "全部 pull 成功：結束碼 0"
-assert_eq "docker pull gitlab/gitlab-ce:18.10.3-ce.0"$'\n'"docker pull gitlab/gitlab-ce:19.5.1-ce.0"$'\n'"docker save -o $SB/out/gl.tar.tmp gitlab/gitlab-ce:18.10.3-ce.0 gitlab/gitlab-ce:19.5.1-ce.0" \
-    "$(sed -E 's#-o [^ ]*/([^/ ]*)\.[A-Za-z0-9]{6} #-o '"$SB"'/out/\1.tmp #' "$STUB_LOG")" "依版本順序逐一 pull，再單一 docker save"
+assert_eq "docker pull gitlab/gitlab-ce:18.10.3-ce.0"$'
+'"docker pull gitlab/gitlab-ce:19.5.1-ce.0"$'
+'"docker build -t gitlab/gitlab-ce:18.10.3-ce.0 -"$'
+'"docker build -t gitlab/gitlab-ce:19.5.1-ce.0 -"$'
+'"docker save -o $SB/out/gl.tar.tmp gitlab/gitlab-ce:18.10.3-ce.0 gitlab/gitlab-ce:19.5.1-ce.0" \
+    "$(sed -E 's#-o [^ ]*/([^/ ]*)\.[A-Za-z0-9]{6} #-o '"$SB"'/out/\1.tmp #' "$STUB_LOG")" "依版本順序逐一 pull、補 locale（build），再單一 docker save"
 assert_status 0 "產生 tar" test -f "$SB/out/gl.tar"
 assert_eq "" "$(ls "$SB/out" | grep -v '^gl.tar$' || true)" "輸出目錄沒有暫存殘留"
 assert_contains "$(cat "$OPS_ENV_FILE")" "GLC_VERSIONS=19.5.1 18.10.3" "版本清單存入參數檔"
 assert_contains "$(cat "$OPS_ENV_FILE")" "GLC_BUNDLE_TAR=$SB/out/gl.tar" "tar 路徑存入參數檔"
+assert_contains "$(cat "$STUB_LOG.dockerfile")" "localedef -i zh_TW -f UTF-8 zh_TW.UTF-8" "補 locale：Dockerfile 產生預設 zh_TW.UTF-8"
 
 setup_sandbox build_pullfail
 FAIL_PULL=18.11.13 bash -c ". '$dkr'; printf '%s\n%s\n' '18.10.3 18.11.13 19.2.9' '$SB/out/gl.tar' | docker_build_bundle" >"$SB/o.txt" 2>&1 && r=0 || r=$?
@@ -76,6 +91,14 @@ setup_sandbox build_savefail
 FAIL_SAVE=1 bash -c ". '$dkr'; printf '%s\n%s\n' '18.10.3' '$SB/out/gl.tar' | docker_build_bundle" >"$SB/o.txt" 2>&1 && r=0 || r=$?
 assert_eq "1" "$r" "docker save 失敗：非 0"
 assert_eq "" "$(ls "$SB/out")" "docker save 失敗：不留半成品 tar"
+
+setup_sandbox build_localefail
+FAIL_BUILD=1 bash -c ". '$dkr'; printf '%s
+%s
+' '18.10.3' '$SB/out/gl.tar' | docker_build_bundle" >"$SB/o.txt" 2>&1 && r=0 || r=$?
+assert_eq "1" "$r" "補 locale 失敗：非 0"
+assert_eq "" "$(ls "$SB/out")" "補 locale 失敗：不產生 tar"
+assert_not_contains "$(cat "$STUB_LOG")" "docker save" "補 locale 失敗：不呼叫 docker save"
 
 setup_sandbox build_badlist
 printf '%s\n%s\n%s\n' "18.10.3 abc" "18.11.13" "$SB/out/gl.tar" | bash -c ". '$dkr'; docker_build_bundle" >"$SB/o.txt" 2>&1 && r=0 || r=$?

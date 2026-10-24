@@ -44,6 +44,28 @@ docker_normalize_versions() { # docker_normalize_versions "<清單>"
     printf '%s' "$list" | sort_versions asc | awk '!seen[$0]++'
 }
 
+# 官方映像只有 C／C.utf8／en_US.utf8。deb 時代建的資料庫若用其他 LC_COLLATE（例如 zh_TW.UTF-8），
+# 容器內 PostgreSQL 會報 `database locale is incompatible with operating system` 而起不來。
+# 伺服器沒有網路，所以在【有網路的電腦】把 locale 烤進映像（同 tag 覆蓋），隨映像包一起帶過去。
+GLC_DB_LOCALE="${GLC_DB_LOCALE:-zh_TW.UTF-8}"
+
+# 在官方映像上加裝 locale 的 Dockerfile（stdout）。locale 須為 語言_地區.編碼 形式，否則回非 0。
+docker_locale_dockerfile() { # docker_locale_dockerfile <映像參照> <locale>
+    local ref="$1" loc="$2" name charmap
+    [[ $loc =~ ^[A-Za-z]+_[A-Za-z]+\.[A-Za-z0-9-]+$ ]] || return 1
+    [ -n "$ref" ] || return 1
+    name="${loc%%.*}"
+    charmap="${loc#*.}"
+    cat <<DOCKERFILE
+FROM $ref
+RUN apt-get update \\
+ && apt-get install -y --no-install-recommends locales \\
+ && localedef -i $name -f $charmap $loc \\
+ && locale -a | grep -qi '^${name}\\.${charmap//-/}\$' \\
+ && rm -rf /var/lib/apt/lists/*
+DOCKERFILE
+}
+
 # ask_param 用的驗證函式：清單合法回 0。
 valid_docker_version_list() { docker_normalize_versions "$1" >/dev/null 2>&1; }
 
@@ -431,6 +453,12 @@ docker_build_bundle() {
     for ref in "${refs[@]}"; do
         docker pull "$ref" || die "拉取 $ref 失敗。請確認這台可連外、該版本存在。"
     done
+    # 補上資料庫 locale：同 tag 覆蓋，之後 docker save 存的就是加料後的映像。
+    for ref in "${refs[@]}"; do
+        echo "══ 補上 locale $GLC_DB_LOCALE：$ref ══"
+        docker_locale_dockerfile "$ref" "$GLC_DB_LOCALE" | docker build -t "$ref" - \
+            || die "補 locale 失敗（$ref）。請確認這台可連外，且 GLC_DB_LOCALE（$GLC_DB_LOCALE）格式為 zh_TW.UTF-8。"
+    done
     tmp="$(mktemp "$tar_file.XXXXXX")" || die "無法在 $(dirname "$tar_file") 建立暫存檔。"
     docker save -o "$tmp" "${refs[@]}" || rc=$?
     if [ "$rc" -ne 0 ]; then rm -f "$tmp"; die "docker save 失敗，未產生映像包。"; fi
@@ -707,6 +735,11 @@ show_troubleshooting() {
     - 80、443、2222 被占用：ss -ltn 查出占用者（deb 版沒停乾淨最常見）。
     - docker ps -a 看狀態；docker inspect -f '{{.State.Health.Status}}' gitlab 看是否 healthy。
       啟動後 healthy 要數分鐘，18.11 因 PostgreSQL 升級更久。
+  PostgreSQL 起不來、日誌出現 database locale is incompatible with operating system：
+    deb 時代的資料庫用了容器沒有的 LC_COLLATE（例如 zh_TW.UTF-8）。伺服器無網路，無法在容器內補裝；
+    請在【有網路的電腦】重新執行選單 1（會把 locale 烤進同 tag 映像），scp 到伺服器後執行選單 2，
+    再 docker rm -f gitlab 並重新啟動容器（資料在掛載目錄，不會遺失）。不要為了啟動而改資料庫 collation。
+    其他 locale 可用環境變數 GLC_DB_LOCALE 指定（預設 zh_TW.UTF-8）。
   前置檢查失敗：照訊息處理。deb 版本與映像版本必須相同；映像未載入先執行選單 2；已有名為 gitlab 的容器不會被覆蓋。
   背景遷移一直不是 0（逾時）：
     - docker exec gitlab gitlab-ctl status sidekiq，並看 docker exec gitlab gitlab-ctl tail sidekiq
