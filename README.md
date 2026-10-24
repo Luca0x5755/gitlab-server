@@ -24,11 +24,12 @@ gitlab-server/
 
 | 腳本 | 說明 |
 | --- | --- |
-| [install.sh](scripts/install.sh) | 離線安裝：加入套件來源、下載 `.deb`、`scp` 傳送、`dpkg -i` 安裝、`external_url`、初始密碼、HTTPS、LDAP（AD） |
+| [docker.sh](scripts/docker.sh) | GitLab 容器（Docker）：打包與載入 GitLab 映像包、Docker 離線包、deb 遷移到容器（沿用資料）、purge 舊 deb、逐站升級；選單含說明與排查（遷移、purge、升級尚未在實機試跑） |
+| [install.sh](scripts/install.sh) | 僅適用 deb 安裝。離線安裝：加入套件來源、下載 `.deb`、`scp` 傳送、`dpkg -i` 安裝、`external_url`、初始密碼、HTTPS、LDAP（AD） |
 | [backup.sh](scripts/backup.sh) | 備份選單：立即備份、列出、保留期限、crontab、複製設定備份、還原與還原後驗證 |
 | [backup_auto.sh](scripts/backup_auto.sh) | 自動備份（資料備份＋設定備份），供 cron、升級前、選單共用 |
-| [upgrade.sh](scripts/upgrade.sh) | 版本升級：吃一個 `.deb` 資料夾，逐版升級並等背景遷移歸零 |
-| [nginx.sh](scripts/nginx.sh) | 外部 Nginx：離線打包與安裝、停用內建 Nginx、反向代理設定、切回內建 |
+| [upgrade.sh](scripts/upgrade.sh) | 僅適用 deb 安裝。版本升級：吃一個 `.deb` 資料夾，逐版升級並等背景遷移歸零 |
+| [nginx.sh](scripts/nginx.sh) | 僅適用 deb 安裝。外部 Nginx：離線打包與安裝、停用內建 Nginx、反向代理設定、切回內建 |
 | [network.sh](scripts/network.sh) | 以 Netplan 設定固定 IP |
 | [runner.sh](scripts/runner.sh) | GitLab Runner（CI）：離線打包與安裝 Docker、載入 image、註冊 instance runner、驗證、取消註冊、清理 |
 

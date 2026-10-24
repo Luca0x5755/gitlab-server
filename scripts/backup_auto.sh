@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # GitLab 自動備份：先資料備份，再設定備份（gitlab-ctl backup-etc），最後清理過期的設定備份。
 # cron、升級前（upgrade.sh）與 backup.sh 的「立即備份」共用這一份。
+# 容器模式（名為 gitlab 的容器執行中）時，兩個指令改以 docker exec 在容器內執行；
+# 產物仍落在宿主機掛載的 /var/opt/gitlab/backups 與 /etc/gitlab/config_backup。
 # 非互動：不問任何問題，才能被 cron 呼叫；不收參數。
 #
 # 結束碼：0 全部成功；1 資料備份失敗；2 設定備份失敗（沒有設定備份，資料備份無法還原，
@@ -33,10 +35,15 @@ prune_config_backups() {
 main() {
     set -uo pipefail
     reject_args "$@"
-    require_machine server
+    # 模式只在開頭探測一次，避免備份中途容器狀態改變而前後走不同路徑。
+    _GITLAB_MODE="$(gitlab_mode)"
+    require_gitlab_host
     require_root
-    have_cmd gitlab-backup || die "找不到 gitlab-backup。"
-    have_cmd gitlab-ctl || die "找不到 gitlab-ctl。"
+    # 容器模式的指令在容器裡，宿主機（deb 已移除）沒有 gitlab-backup／gitlab-ctl，不檢查。
+    if [ "$_GITLAB_MODE" = deb ]; then
+        have_cmd gitlab-backup || die "找不到 gitlab-backup。"
+        have_cmd gitlab-ctl || die "找不到 gitlab-ctl。"
+    fi
 
     local log deleted
     log="$(backup_log_file)"
@@ -45,7 +52,7 @@ main() {
     bka_log "========== 開始 GitLab 備份 =========="
 
     bka_log "[1/3] 資料備份..."
-    if gitlab-backup create CRON=1 >>"$log" 2>&1; then
+    if gitlab_run gitlab-backup create CRON=1 >>"$log" 2>&1; then
         bka_log "[1/3] 資料備份完成"
     else
         bka_log "[1/3] ✗ 資料備份失敗（詳見 $log）"
@@ -53,7 +60,7 @@ main() {
     fi
 
     bka_log "[2/3] 設定備份（gitlab-ctl backup-etc）..."
-    if gitlab-ctl backup-etc >>"$log" 2>&1; then
+    if gitlab_run gitlab-ctl backup-etc >>"$log" 2>&1; then
         bka_log "[2/3] 設定備份完成 → $(config_backup_dir)"
     else
         bka_log "[2/3] ✗ 設定備份失敗（詳見 $log）。沒有設定備份，資料備份無法還原。"

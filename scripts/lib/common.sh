@@ -136,6 +136,44 @@ require_machine() {
     esac
 }
 
+# ── GitLab 執行模式（deb 或容器）─────────────────────────────────────────────
+
+# 名為 gitlab 的容器正在執行才算容器模式（名稱完全相等；gitlab-runner、已停止、
+# docker 沒裝或連不上都不算），其餘一律 deb：容器不在就照舊走 deb，不猜。
+gitlab_mode() {
+    local running
+    if have_cmd docker \
+        && running="$(docker inspect --type container -f '{{.State.Running}}' gitlab 2>/dev/null)" \
+        && [ "$running" = true ]; then
+        echo container
+    else
+        echo deb
+    fi
+}
+
+# 組出要執行的完整指令，一詞一行：容器模式加上 `docker exec gitlab` 前綴，deb 模式原樣。
+# 不加 -t：cron 沒有 tty。
+gitlab_exec_args() { # gitlab_exec_args <指令…>
+    if [ "${_GITLAB_MODE:-$(gitlab_mode)}" = container ]; then
+        printf '%s\n' docker exec gitlab "$@"
+    else
+        printf '%s\n' "$@"
+    fi
+}
+
+# 依目前模式執行 GitLab 指令（gitlab-backup、gitlab-ctl…），回傳該指令的結束碼。
+# 若呼叫端已把模式存進 _GITLAB_MODE（不 export），就用它，不再重新探測。
+gitlab_run() { # gitlab_run <指令…>
+    local -a cmd
+    mapfile -t cmd < <(gitlab_exec_args "$@")
+    "${cmd[@]}"
+}
+
+# 備份類動作的機器檢查：容器模式（deb 已移除也成立）直接通過，否則等同 require_machine server。
+require_gitlab_host() {
+    [ "${_GITLAB_MODE:-$(gitlab_mode)}" = container ] || require_machine server
+}
+
 # 會改系統檔的動作先確認是 root，免得做到一半才因權限失敗而留下半套狀態。
 require_root() {
     [ "$(current_uid)" -eq 0 ] || die "需要 root 權限，請用 sudo 執行。"
@@ -163,6 +201,20 @@ menu_loop() {
         [ "$rc" -eq 0 ] || echo "✗ 動作未完成（結束碼 $rc）。" >&2
         echo
     done
+}
+
+
+# 背景遷移輪詢共用（upgrade.sh 與 docker.sh）：
+# 取出 `gitlab-rails runner` 輸出（stdin）中最後一個純數字行（前面可能有警告訊息）。
+# 找不到回非 0。
+parse_queued_count() {
+    local line n=""
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        [[ $line =~ ^[0-9]+$ ]] && n="$line"
+    done
+    [ -n "$n" ] || return 1
+    printf '%s\n' "$n"
 }
 
 # ── 版本字串（純函式；ISSUE-007／008 直接使用，勿另行定義）──────────────────────
@@ -550,4 +602,50 @@ parse_dep_pkgs() {
     out="$(grep -E '^[A-Za-z0-9][A-Za-z0-9.+-]*$' | LC_ALL=C sort -u)" || true
     [ -n "$out" ] || return 1
     printf '%s\n' "$out"
+}
+
+# ── Docker 離線安裝（docker.sh、runner.sh 共用；PR-DKR-04）─────────────────────
+# 呼叫端常在 `|| rc=$?` 內使用，set -e 會失效，所以每個會失敗的步驟都明確檢查，不依賴 set -e。
+
+# 在 <stage> 下載 docker.io 與其全部相依的 .deb。解析失敗、解析不到任何套件、下載失敗皆回非 0。
+docker_download_debs() { # docker_download_debs <stage>
+    local stage="$1" deps pkgs=()
+    echo "── 下載 docker.io 與其相依套件 ──"
+    # 先收進變數再解析：行程替換會吞掉 apt-cache 的結束碼。
+    deps="$(apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts \
+        --no-breaks --no-replaces --no-enhances docker.io)" \
+        || { echo "✗ 解析 docker.io 的相依失敗。" >&2; return 1; }
+    mapfile -t pkgs < <(parse_dep_pkgs <<<"$deps")
+    [ "${#pkgs[@]}" -gt 0 ] || { echo "✗ 解析不到任何相依套件。" >&2; return 1; }
+    (cd "$stage" && apt-get download "${pkgs[@]}") || { echo "✗ apt-get download 失敗。" >&2; return 1; }
+}
+
+# 把離線包解到 <dir>：先複製成私有副本再檢查、解包，避免檢查通過後原檔被換掉（TOCTOU）。
+# 失敗回非 0，由呼叫端清除 <dir>。
+unpack_offline_tar() { # unpack_offline_tar <tar.gz> <dir>
+    local tarball="$1" dir="$2"
+    if ! cp "$tarball" "$dir/offline.tar.gz" || ! check_offline_tar "$dir/offline.tar.gz" \
+        || ! tar xzf "$dir/offline.tar.gz" -C "$dir" --no-same-owner; then
+        rm -f "$dir/offline.tar.gz"
+        return 1
+    fi
+    rm -f "$dir/offline.tar.gz"
+}
+
+# 列出 <dir> 內的 .deb、確認後 dpkg -i。回傳：0 成功；100 使用者取消（已印說明）；其他為 dpkg 的結束碼。
+install_debs_in() { # install_debs_in <dir>
+    local dir="$1" f rc=0
+    echo "將以 dpkg -i 安裝下列套件（相依套件若比系統現有的新，可能一併升級系統套件）："
+    for f in "$dir"/*.deb; do echo "  ${f##*/}"; done
+    if ! confirm "確定安裝？"; then
+        echo "已取消，未做任何變更。"
+        return 100
+    fi
+    dpkg -i "$dir"/*.deb || rc=$?
+    [ "$rc" -eq 0 ] || { echo "✗ dpkg -i 失敗（結束碼 $rc）；相依套件不足時請見選單「常見問題排查」。" >&2; return "$rc"; }
+}
+
+# 啟用並啟動 docker 服務；失敗只警告（套件已裝好），恆回 0。
+docker_enable_service() {
+    systemctl enable --now docker || echo "⚠ 無法啟動 docker 服務，請手動檢查。"
 }

@@ -192,7 +192,7 @@ runner_default_tarball() { echo "$(sudo_home_dir)/runner-offline.tar.gz"; }
 
 # 【GitLab 伺服器】解包離線包並 dpkg -i；先比對 Runner 與 GitLab 版本、檢查剩餘磁碟，不符都警告並詢問。
 runner_install_offline() {
-    local tarball dir rc=0 f gl rv avail
+    local tarball dir rc=0 gl rv avail
     require_machine server
     require_cmds dpkg dpkg-deb tar systemctl df
     require_root
@@ -200,13 +200,8 @@ runner_install_offline() {
         || die "離線包路徑不合法。"
     [ -f "$tarball" ] || die "找不到離線包：$tarball"
     dir="$(mktemp -d "${TMPDIR:-/tmp}/runner-install.XXXXXX")" || die "建立暫存目錄失敗。"
-    # 與 nginx.sh 相同：先複製成私有副本再檢查、解包，避免檢查通過後原檔被換掉（TOCTOU）。
-    if ! cp "$tarball" "$dir/offline.tar.gz" || ! check_offline_tar "$dir/offline.tar.gz" \
-        || ! tar xzf "$dir/offline.tar.gz" -C "$dir" --no-same-owner; then
-        rm -rf "$dir"
-        die "離線包無法安全解開：$tarball"
-    fi
-    rm -f "$dir/offline.tar.gz"
+    # 解包（私有副本、TOCTOU 防護、離線包檢查）是共用函式，見 common.sh。
+    unpack_offline_tar "$tarball" "$dir" || { rm -rf "$dir"; die "離線包無法安全解開：$tarball"; }
     [ -f "$dir/gitlab-runner_amd64.deb" ] || { rm -rf "$dir"; die "離線包內沒有 gitlab-runner_amd64.deb。"; }
 
     gl="$(runner_gitlab_version "${GITLAB_OPT_DIR:-/opt/gitlab}/version-manifest.txt")" \
@@ -222,17 +217,12 @@ runner_install_offline() {
         confirm "仍要繼續？" || { rm -rf "$dir"; echo "已取消，未做任何變更。"; return 0; }
     fi
 
-    echo "將以 dpkg -i 安裝下列套件（相依套件若比系統現有的新，可能一併升級系統套件）："
-    for f in "$dir"/*.deb; do echo "  ${f##*/}"; done
-    if ! confirm "確定安裝？"; then
-        rm -rf "$dir"
-        echo "已取消，未做任何變更。"
-        return 0
-    fi
-    dpkg -i "$dir"/*.deb || rc=$?
+    # 列出、確認、dpkg -i 與啟用 docker 服務都是 Docker 離線安裝的共用函式（見 common.sh）。
+    install_debs_in "$dir" || rc=$?
     rm -rf "$dir"
-    [ "$rc" -eq 0 ] || { echo "✗ dpkg -i 失敗（結束碼 $rc）；相依套件不足時請見選單「常見問題排查」。" >&2; return "$rc"; }
-    systemctl enable --now docker || echo "⚠ 無法啟動 docker 服務，請手動檢查。"
+    [ "$rc" -ne 100 ] || return 0 # 使用者取消：已說明，不算失敗
+    [ "$rc" -eq 0 ] || return "$rc"
+    docker_enable_service
     echo "✓ 已安裝 Docker 與 gitlab-runner。下一步：載入映像包、註冊 Runner。"
 }
 
@@ -243,13 +233,9 @@ valid_runner_version() { [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
 # 在暫存目錄 <stage> 內完成：下載 docker.io 與其相依、gitlab-runner 與 helper images，打包到 <tarball>。
 # 在 `|| rc=$?` 條件中被呼叫，set -e 會失效，所以每個會失敗的步驟都明確檢查。
 _rnr_build_in() { # _rnr_build_in <stage> <tarball> <runner 版本>
-    local stage="$1" tarball="$2" ver="$3" deb pkgs=()
-    echo "── 下載 docker.io 與其相依套件 ──"
-    mapfile -t pkgs < <(apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts \
-        --no-breaks --no-replaces --no-enhances docker.io | parse_dep_pkgs) \
-        || { echo "✗ 解析 docker.io 的相依失敗。" >&2; return 1; }
-    [ "${#pkgs[@]}" -gt 0 ] || { echo "✗ 解析不到任何相依套件。" >&2; return 1; }
-    (cd "$stage" && apt-get download "${pkgs[@]}") || { echo "✗ apt-get download 失敗。" >&2; return 1; }
+    local stage="$1" tarball="$2" ver="$3" deb
+    # docker.io 與其相依的解析與下載是共用函式（docker.sh 同用，見 common.sh）。
+    docker_download_debs "$stage" || return 1
     echo "── 下載 gitlab-runner $ver 與 helper images ──"
     for deb in gitlab-runner_amd64.deb gitlab-runner-helper-images.deb; do
         curl -fsSL "$RNR_DL_BASE/v$ver/deb/$deb" -o "$stage/$deb" \

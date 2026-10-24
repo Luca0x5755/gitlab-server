@@ -58,3 +58,19 @@ _Avoid_: 註冊 token（舊版 registration token 流程已不用）
 **映像包**:
 【有網路的電腦】以 `docker pull`＋`docker save` 打成的單一 tar，內含 CI job 會用到的 image，在【GitLab 伺服器】以 `docker load` 載入，供 `pull_policy = if-not-present` 使用。
 _Avoid_: 映像檔（單指一個 image，而映像包是一整批）
+
+**GitLab 容器**:
+在【GitLab 伺服器】上以 `gitlab/gitlab-ce:<版本>-ce.0` 映像執行、名為 `gitlab` 的單一容器，取代 deb 安裝的 GitLab。內建 Nginx 與 PostgreSQL 都在容器內。
+_Avoid_: Docker 版本（會被讀成 Docker Engine 的版本）、GitLab 映像（那是映像，不是正在跑的容器）
+
+**掛載目錄**:
+GitLab 容器以 bind mount 掛入的三個宿主機目錄：`/etc/gitlab`、`/var/opt/gitlab`、`/var/log/gitlab`。路徑與 deb 安裝時相同，所以遷移時資料不搬動。
+_Avoid_: volume（易被讀成 Docker named volume）、資料目錄（只指 `/var/opt/gitlab`，漏了設定與日誌）
+
+**GitLab 映像包**:
+【有網路的電腦】以 `docker pull`＋`docker save` 打成的 tar，內含升級路徑上各中間版本的 `gitlab/gitlab-ce` 映像，在【GitLab 伺服器】以 `docker load` 載入。與「映像包」做法相同、內容不同（後者是 CI job 用的 image）。
+_Avoid_: 升級包（沒說明是映像）
+
+**Git SSH 埠**:
+GitLab 容器發佈到宿主機、供 `git clone ssh://` 使用的埠，固定 2222；宿主機 sshd 的 22 不動，仍供管理員 `ssh`／`scp`。
+_Avoid_: SSH 埠（沒說明是 Git 用還是管理用）

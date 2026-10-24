@@ -55,18 +55,6 @@ select_upgrade_debs() { # select_upgrade_debs <已裝版本> [本機架構]
     printf '%s' "$keyed" | LC_ALL=C sort | cut -f2-
 }
 
-# 取出 `gitlab-rails runner` 輸出（stdin）中最後一個純數字行（前面可能有警告訊息）。
-# 找不到回非 0。
-parse_queued_count() {
-    local line n=""
-    while IFS= read -r line || [ -n "$line" ]; do
-        line="${line%$'\r'}"
-        [[ $line =~ ^[0-9]+$ ]] && n="$line"
-    done
-    [ -n "$n" ] || return 1
-    printf '%s\n' "$n"
-}
-
 # ── 說明與排查 ───────────────────────────────────────────────────────────────
 
 show_help() {
