@@ -49,7 +49,8 @@ docker_normalize_versions() { # docker_normalize_versions "<清單>"
 # 伺服器沒有網路，所以在【有網路的電腦】把 locale 烤進映像（同 tag 覆蓋），隨映像包一起帶過去。
 GLC_DB_LOCALE="${GLC_DB_LOCALE:-zh_TW.UTF-8}"
 
-# 在官方映像上加裝 locale 的 Dockerfile（stdout）。locale 須為 語言_地區.編碼 形式，否則回非 0。
+# 在官方映像上加裝 locale 的 Dockerfile（stdout）。安裝 locales 套件會重建 locale 資料而洗掉原有的 en_US.utf8，
+# 所以一併補回，讓新映像是原映像的超集。locale 須為 語言_地區.編碼 形式，否則回非 0。
 docker_locale_dockerfile() { # docker_locale_dockerfile <映像參照> <locale>
     local ref="$1" loc="$2" name charmap
     [[ $loc =~ ^[A-Za-z]+_[A-Za-z]+\.[A-Za-z0-9-]+$ ]] || return 1
@@ -61,7 +62,9 @@ FROM $ref
 RUN apt-get update \\
  && apt-get install -y --no-install-recommends locales \\
  && localedef -i $name -f $charmap $loc \\
+ && localedef -i en_US -f UTF-8 en_US.UTF-8 \\
  && locale -a | grep -qi '^${name}\\.${charmap//-/}\$' \\
+ && locale -a | grep -qi '^en_US\\.utf8\$' \\
  && rm -rf /var/lib/apt/lists/*
 DOCKERFILE
 }
