@@ -32,6 +32,8 @@ assert_contains "$df" "FROM gitlab/gitlab-ce:19.5.1-ce.0" "Dockerfile 以官方�
 assert_contains "$df" "apt-get install -y --no-install-recommends locales" "安裝 locales 套件"
 assert_contains "$df" "localedef -i zh_TW -f UTF-8 zh_TW.UTF-8" "產生 zh_TW.UTF-8"
 assert_contains "$df" "grep -qi '^zh_TW\.UTF8$'" "建置時驗證 locale -a 看得到"
+assert_contains "$df" "localedef -i en_US -f UTF-8 en_US.UTF-8" "補回原映像的 en_US.UTF-8"
+assert_contains "$df" "grep -qi '^en_US\.utf8$'" "建置時驗證 en_US.utf8 仍在"
 assert_nonzero "locale 含注入字元拒絕" docker_locale_dockerfile x 'zh_TW.UTF-8;id'
 assert_nonzero "locale 格式錯誤拒絕" docker_locale_dockerfile x zhTW
 
